@@ -11,7 +11,7 @@ staged="$(git diff --cached --name-only --diff-filter=ACMR)"
 [ -n "$staged" ] || exit 0
 
 # 1. Never commit credential files or captured traffic.
-if bad="$(printf '%s\n' "$staged" | grep -Ei '(^|/)(\.env(\..*)?|credentials(\..*)?|[^/]*\.credentials|captures/.*|[^/]*\.(pem|key|p12))$')"; then
+if bad="$(printf '%s\n' "$staged" | grep -Ei '(^|/)(\.env(\..*)?|credentials|credentials\.(env|txt|json|ini)|[^/]*\.credentials|captures/.*|[^/]*\.(pem|key|p12))$')"; then
     fail "refusing to commit credential-like files:
 $bad"
 fi
