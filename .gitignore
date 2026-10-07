@@ -1,2 +1,10 @@
 /target
 *.log
+
+# Credentials and captures must never be committed
+.env
+.env.*
+*.credentials
+credentials
+credentials.*
+captures/

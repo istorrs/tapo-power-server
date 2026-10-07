@@ -391,3 +391,102 @@ server unsurprising:
 - Exact port-indexing convention to settle on for the 6 outlets (0-5 vs
   1-6) — pick one, document it clearly in this repo's own README once
   decided, since pyhil's side will need to know it.
+
+## 12. Decisions and research findings (supersede earlier sections where they conflict)
+
+Resolved after reading the reference implementation and probing the real
+P316M (read-only `login/discover`).
+
+### Decisions
+
+- **Port indexing: 1-based.** Ports 1-6 match the physical outlet labels.
+  Anything outside 1-6 (including 0) is a 400 `InvalidArgument`. Document
+  this in the README as well (§11 open question, now closed).
+- **Curve/cipher scope for v1: P-256 only.** The reference client only ever
+  offers cipher suite 1 (P-256, SHA-256, HMAC-SHA256, `aes_128_ccm`), so the
+  device will negotiate that. P-384/P-521, CMAC and AES-256 are out of scope.
+- **SPAKE2+ is implemented directly on RustCrypto `p256`, not via
+  `pakery-spake2plus`** (supersedes §2/§5). TPAP deviates from RFC 9383 in
+  ways that crate hardcodes (see "Protocol details"), and the crate is young
+  and single-author. Use RFC 9383 vectors only as an arithmetic sanity check.
+- **Hardware tests may only switch outlets 2-5.** Real equipment is plugged
+  into outlets 1 and 6. Enforce with an allowlist in the test harness.
+  Read-only calls are always fine. The server itself must not hardcode this.
+
+### Device observations (P316M, discover response)
+
+`{"tpap_preferred":true,"mac":"58D81266B9EC","tpap":{"tls":0,"dac":1,"noc":1,"pake":[2],"port":80}}`
+
+- `pake` is `[2]`: no passcode type 0, so the MAC-derived default passcode
+  path is **not** available. TP-Link account email/password (`userpw`) is
+  required.
+- `tls` 0 with `dac` 1: plain HTTP, and the client must send `dac_nonce`
+  (16 random bytes, base64) in `pake_share`. The reference never validates
+  the device's DAC response; confirm behaviour on hardware.
+- No `user_hash_type`: the login username is lowercase hex MD5 of `"admin"`.
+
+### Protocol details (from the reference's TpapTransport.cs; unverified on hardware)
+
+- Handshake: `login` with `sub_method` `discover`, `pake_register`,
+  `pake_share`, all `POST /` as JSON. Session traffic is
+  `POST /stok=<sessionId>/ds`, `application/octet-stream`.
+- `pake_register` sends `username`, `user_random` (32 random bytes, b64),
+  `cipher_suites:[1]`, `encryption:["aes_128_ccm"]`, `passcode_type`, and an
+  explicit `stok:null`. Device returns `dev_random`, `dev_salt`, `dev_share`,
+  `iterations`, chosen suite and encryption.
+- Credential string for `userpw` comes from the device's `extra_crypt`
+  (`password_shadow`, `password_authkey`, `password_sha_with_salt`, or
+  `username/password` fallback). It is the PBKDF2-HMAC-SHA256 password; salt
+  is `dev_salt`; 80 bytes derived; `w0` = first 40 bytes mod n, `w1` = next
+  40 bytes mod n.
+- Prover: `L = x*G + w0*M`; `R' = R - w0*N`; `Z = x*R'`; `V = w1*R'`. M/N are
+  the RFC 9383 P-256 points.
+- Transcript: items each prefixed with an 8-byte little-endian length:
+  `H("PAKE V1" || user_random || dev_random)`, empty, empty, M, N, L, R, Z, V,
+  `w0enc`. Points are uncompressed SEC1. **`w0enc` is the minimal big-endian
+  bytes of `w0` with a quirky odd/even padding rule** (reference lines
+  ~1579-1593) - replicate exactly, it differs from RFC 9383's fixed width.
+- Confirmation matches RFC 9383: `HKDF(TH, zero salt, "ConfirmationKeys")`
+  split into KcA/KcB, `user_confirm = HMAC(KcA, R)`, expect
+  `dev_confirm = HMAC(KcB, L)`; `SharedKey = HKDF(TH, "SharedKey")`.
+- Session keys: HKDF-SHA256 from SharedKey with salt/info
+  `tp-kdf-salt-aes128-key` / `tp-kdf-info-aes128-key` (16 bytes) and
+  `...-aes128-iv` (12-byte base nonce).
+- AES-128-CCM, 16-byte tag, 12-byte nonce `= baseNonce[0..8] || BE32(seq)`,
+  no AAD. Request body `BE32(seq) || ciphertext || tag`. Sequence starts at
+  `start_seq` and increments on every request including keep-alives.
+  A response starting with `{` or `[` is a plaintext error envelope.
+- Keep-alive: a normal `get_device_info` after ~45 s idle. One full
+  re-handshake plus resend on error codes 9999, 1002, -40401, -40413. Auth
+  errors (-1501, -2202, -2203, -2101) are not retried; the device enforces a
+  failed-attempt lockout, so never loop on bad credentials.
+- Commands: `{"method":..., "params":..., "request_time_milis":..., "terminal_uuid":...}`.
+  Outlet state from `get_child_device_list` (paged). Switching is expected to
+  be `control_child` with `requestData` `{"method":"set_device_info","params":{"device_on":bool}}`
+  addressed by child `device_id`. **Not implemented in the reference for Tapo
+  strips; verify on hardware.**
+- The reference repo has no test vectors or captured traffic; generate golden
+  vectors by capturing real sessions.
+
+### Hardware-verified findings (P316M, firmware 1.4.1, 2026-10-07)
+
+- The reading of the reference implementation above is correct: a single
+  login against the real device succeeds, the confirmation matches, and
+  encrypted requests with the derived keys and sequence numbers work.
+- **HTTP quirk:** the device only recognises a title-case `Content-Length`
+  header. Lowercase (as sent by hyper by default) makes it ignore the body and
+  reply with `<html><body><center>200 OK</center></body></html>`. The client
+  uses `http1_title_case_headers`.
+- `extra_crypt` handling for `userpw` login worked with the account
+  email/password; the device-side lockout counter is never exercised on
+  success. The `dac_nonce` is sent when `tls == 0 && dac == 1`; the device
+  accepted it and the DAC response is not validated (as in the reference).
+- **Outlet control:** `get_child_device_list` returns six children with keys
+  including `device_id`, `position` (1-6), `device_on`, `nickname` (base64).
+  `device_id` is the parent id plus a two-digit index. Switching is
+  `control_child` with `requestData` `{"method":"set_device_info","params":{"device_on":bool}}`
+  and works as inferred; the wrapped result carries its own `error_code` under
+  `result.response_data`.
+- Outlet results in the HTTP API are the resulting on/off state as a boolean.
+  pyhil's exact return-value convention for `/turn_on` etc. was not available
+  while building this; adjust if the broker expects something else.
