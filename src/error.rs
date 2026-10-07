@@ -21,6 +21,10 @@ pub enum TapoError {
     /// The device returned a non-zero `error_code`.
     #[error("device returned error code {code}")]
     Device { code: i64 },
+    /// The session can no longer be used (e.g. its sequence numbers are used up)
+    /// and a fresh one must be established.
+    #[error("session expired: {0}")]
+    SessionExpired(String),
     /// Malformed or unexpected protocol data.
     #[error("protocol error: {0}")]
     Protocol(String),
@@ -37,6 +41,7 @@ impl TapoError {
             Self::Unsupported(_) => "Unsupported",
             Self::Authentication(_) => "AuthenticationError",
             Self::Device { .. } => "DeviceError",
+            Self::SessionExpired(_) => "SessionExpired",
             Self::Protocol(_) => "ProtocolError",
             Self::Transport(_) => "TransportError",
         }
@@ -55,6 +60,7 @@ impl TapoError {
     /// Whether a fresh handshake plus one resend is appropriate.
     pub fn is_session_error(&self) -> bool {
         match self {
+            Self::SessionExpired(_) => true,
             Self::Device { code } => RETRYABLE_CODES.contains(code),
             Self::Transport(msg) => msg.contains("reset") || msg.contains("closed"),
             _ => false,
@@ -90,6 +96,7 @@ mod tests {
             assert!(TapoError::Device { code: c }.is_session_error());
         }
         assert!(!TapoError::Device { code: -1010 }.is_session_error());
+        assert!(TapoError::SessionExpired("x".into()).is_session_error());
         assert!(!TapoError::Authentication("x".into()).is_session_error());
         assert!(!TapoError::Transport("timed out".into()).is_session_error());
         assert!(TapoError::Transport("connection reset".into()).is_session_error());

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{Request, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -23,6 +23,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
+use tokio_util::task::TaskTracker;
 
 use crate::{
     error::TapoError,
@@ -35,6 +36,18 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 pub struct AppState {
     pub strip: Arc<Strip>,
     pub token: Option<Arc<String>>,
+    /// Tracks device operations so shutdown can wait for them to finish.
+    pub tracker: TaskTracker,
+}
+
+impl AppState {
+    pub fn new(strip: Arc<Strip>, token: Option<Arc<String>>) -> Self {
+        Self {
+            strip,
+            token,
+            tracker: TaskTracker::new(),
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -48,7 +61,6 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(protected)
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -79,15 +91,37 @@ fn bad(msg: impl Into<String>) -> TapoError {
 /// axum drops a handler's future when the connection closes. A sequence
 /// abandoned halfway could leave an outlet in an intermediate state (a device
 /// held in reset, say), and an interrupted login could confuse the lockout
-/// guard, so device work runs in its own task.
-async fn detached<T, F>(fut: F) -> Result<T, TapoError>
+/// guard, so device work runs in its own task. The task is registered with
+/// `tracker` so that shutdown can wait for it.
+async fn detached<T, F>(tracker: &TaskTracker, fut: F) -> Result<T, TapoError>
 where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, TapoError>> + Send + 'static,
 {
-    tokio::spawn(fut)
+    tracker
+        .spawn(fut)
         .await
         .map_err(|e| TapoError::Protocol(format!("operation task failed: {e}")))?
+}
+
+/// Request body, capped at [`MAX_BODY_BYTES`]. An oversized body is rejected
+/// with the API's own JSON error (a caller mistake, so 400) instead of a
+/// framework-generated plain-text response.
+struct Capped(Bytes);
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for Capped {
+    type Rejection = TapoError;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, TapoError> {
+        axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+            .await
+            .map(Capped)
+            .map_err(|_| {
+                bad(format!(
+                    "request body is too large or unreadable (limit {MAX_BODY_BYTES} bytes)"
+                ))
+            })
+    }
 }
 
 async fn require_token(
@@ -138,22 +172,22 @@ fn parse_json(body: &Bytes) -> Result<Value, TapoError> {
 async fn switch(state: AppState, body: Bytes, on: bool) -> Reply {
     let port = int_field(&parse_json(&body)?, "port")?;
     let strip = state.strip.clone();
-    let new_state = detached(async move { strip.set(port, on).await }).await?;
+    let new_state = detached(&state.tracker, async move { strip.set(port, on).await }).await?;
     Ok(ok(json!(new_state)))
 }
 
-async fn turn_on(State(state): State<AppState>, body: Bytes) -> Reply {
+async fn turn_on(State(state): State<AppState>, Capped(body): Capped) -> Reply {
     switch(state, body, true).await
 }
 
-async fn turn_off(State(state): State<AppState>, body: Bytes) -> Reply {
+async fn turn_off(State(state): State<AppState>, Capped(body): Capped) -> Reply {
     switch(state, body, false).await
 }
 
-async fn toggle(State(state): State<AppState>, body: Bytes) -> Reply {
+async fn toggle(State(state): State<AppState>, Capped(body): Capped) -> Reply {
     let port = int_field(&parse_json(&body)?, "port")?;
     let strip = state.strip.clone();
-    let new_state = detached(async move { strip.toggle(port).await }).await?;
+    let new_state = detached(&state.tracker, async move { strip.toggle(port).await }).await?;
     Ok(ok(json!(new_state)))
 }
 
@@ -170,7 +204,7 @@ async fn get_state(
         .parse::<i64>()
         .map_err(|_| bad("`port` must be an integer"))?;
     let strip = state.strip.clone();
-    let current = detached(async move { strip.state(port).await }).await?;
+    let current = detached(&state.tracker, async move { strip.state(port).await }).await?;
     Ok(ok(json!(current)))
 }
 
@@ -202,12 +236,16 @@ fn parse_steps(v: &Value) -> Result<Vec<Step>, TapoError> {
         .collect()
 }
 
-async fn sequence(State(state): State<AppState>, body: Bytes) -> Reply {
+async fn sequence(State(state): State<AppState>, Capped(body): Capped) -> Reply {
     let v = parse_json(&body)?;
     let port = int_field(&v, "port")?;
     let steps = parse_steps(&v)?;
     let strip = state.strip.clone();
-    let (count, last) = detached(async move { strip.sequence(port, &steps).await }).await?;
+    let (count, last) = detached(
+        &state.tracker,
+        async move { strip.sequence(port, &steps).await },
+    )
+    .await?;
     Ok(ok(json!({"ok": true, "steps": count, "last_result": last})))
 }
 
@@ -221,6 +259,7 @@ mod tests {
     };
 
     struct Harness {
+        tracker: TaskTracker,
         dev: MockDevice,
         base: String,
         http: reqwest::Client,
@@ -232,14 +271,14 @@ mod tests {
         config.port = dev.addr.port();
         let creds = Credentials::new("user@example.com".into(), password.into()).unwrap();
         let strip = Arc::new(Strip::new(TpapClient::new(config, creds).unwrap()));
-        let app = router(AppState {
-            strip,
-            token: token.map(|t| Arc::new(t.to_string())),
-        });
+        let state = AppState::new(strip, token.map(|t| Arc::new(t.to_string())));
+        let tracker = state.tracker.clone();
+        let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Harness {
+            tracker,
             dev,
             base: format!("http://{addr}"),
             http: reqwest::Client::new(),
@@ -377,6 +416,48 @@ mod tests {
         let sets: Vec<&String> = st.log.iter().filter(|l| l.starts_with("set")).collect();
         assert_eq!(sets, ["set 4 true", "set 4 false", "set 4 true"]);
         assert!(st.outlets[3], "sequence ran to its final step");
+    }
+
+    #[tokio::test]
+    async fn shutdown_can_wait_for_operations_whose_client_left() {
+        let h = start(None, "correct horse").await;
+        let impatient = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let body = r#"{"port": 4, "steps": [{"state":"on","hold_ms":200},{"state":"off","hold_ms":200},{"state":"on"}]}"#;
+        assert!(
+            impatient
+                .post(format!("{}/sequence", h.base))
+                .body(body)
+                .send()
+                .await
+                .is_err()
+        );
+        // This is what main() does after the HTTP server stops: close the
+        // tracker and wait. The abandoned sequence must still be running.
+        assert!(!h.tracker.is_empty(), "the operation is being tracked");
+        h.tracker.close();
+        h.tracker.wait().await;
+        let st = h.dev.state.lock().unwrap();
+        let sets: Vec<&String> = st.log.iter().filter(|l| l.starts_with("set")).collect();
+        assert_eq!(sets, ["set 4 true", "set 4 false", "set 4 true"]);
+    }
+
+    #[tokio::test]
+    async fn oversized_body_gets_the_json_error_envelope() {
+        let h = start(None, "correct horse").await;
+        let huge = format!(r#"{{"port": 3, "pad": "{}"}}"#, "x".repeat(100 * 1024));
+        for path in ["/turn_on", "/turn_off", "/toggle", "/sequence"] {
+            let (status, body) = h.post(path, &huge).await;
+            assert_eq!(status, 400, "{path}");
+            assert_eq!(body["error_type"], "InvalidArgument", "{path}");
+            assert!(
+                body["error"].as_str().unwrap().contains("too large"),
+                "{path}"
+            );
+        }
+        assert_eq!(h.dev.state.lock().unwrap().registers, 0);
     }
 
     #[tokio::test]

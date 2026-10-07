@@ -120,11 +120,26 @@ async fn main() {
         }
     });
 
-    let app = router(AppState { strip, token });
-    if let Err(e) = axum::serve(listener, app)
+    let state = AppState::new(strip, token);
+    let tracker = state.tracker.clone();
+    let app = router(state);
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await
-    {
+        .await;
+
+    // HTTP has stopped, but device operations whose client already left (a
+    // sequence mid-hold, say) must finish: dropping the runtime now would abort
+    // them and could leave an outlet in an intermediate state.
+    tracker.close();
+    if !tracker.is_empty() {
+        eprintln!(
+            "waiting for {} device operation(s) to finish",
+            tracker.len()
+        );
+    }
+    tracker.wait().await;
+
+    if let Err(e) = served {
         eprintln!("error: {e}");
         std::process::exit(1);
     }

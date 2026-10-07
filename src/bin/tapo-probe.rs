@@ -18,19 +18,53 @@ fn default_credentials_path() -> PathBuf {
     home.join(".config/tapo-power-server/credentials")
 }
 
+const USAGE: &str = "usage: tapo-probe <device-host> [--credentials-file PATH]";
+
+struct Options {
+    host: String,
+    credentials: PathBuf,
+}
+
+/// Strict parsing: an option that needs a value but has none, an unknown
+/// option, or a stray argument is an error. Silently falling back to the
+/// default credentials file could submit unintended credentials and use up a
+/// login attempt on a device that locks out.
+fn parse_args(args: &[String]) -> Result<Options, String> {
+    let (mut host, mut credentials) = (None, None);
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--credentials-file" => {
+                let value = it
+                    .next()
+                    .filter(|v| !v.starts_with("--"))
+                    .ok_or("--credentials-file needs a path")?;
+                if credentials.replace(PathBuf::from(value)).is_some() {
+                    return Err("--credentials-file given twice".into());
+                }
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
+            positional => {
+                if host.replace(positional.to_string()).is_some() {
+                    return Err("only one device host may be given".into());
+                }
+            }
+        }
+    }
+    Ok(Options {
+        host: host.ok_or("a device host is required")?,
+        credentials: credentials.unwrap_or_else(default_credentials_path),
+    })
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some(host) = args.first().filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: tapo-probe <device-host> [--credentials-file PATH]");
+    let opts = parse_args(&args).unwrap_or_else(|e| {
+        eprintln!("error: {e}\n{USAGE}");
         std::process::exit(2);
-    };
-    let path = args
-        .iter()
-        .position(|a| a == "--credentials-file")
-        .and_then(|i| args.get(i + 1))
-        .map(PathBuf::from)
-        .unwrap_or_else(default_credentials_path);
+    });
+    let (host, path) = (opts.host, opts.credentials);
 
     let creds = match Credentials::from_file(&path) {
         Ok(c) => c,
@@ -39,7 +73,7 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let client = TpapClient::new(ClientConfig::new(host.clone()), creds).expect("client");
+    let client = TpapClient::new(ClientConfig::new(host), creds).expect("client");
 
     println!("logging in (single attempt)...");
     if let Err(e) = client.connect().await {
@@ -95,5 +129,43 @@ async fn main() {
             }
         }
         Err(e) => eprintln!("get_child_device_list failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_host_and_optional_credentials_path() {
+        let o = parse_args(&args(&["10.0.0.5"])).unwrap();
+        assert_eq!(o.host, "10.0.0.5");
+        let o = parse_args(&args(&["--credentials-file", "/x/c", "10.0.0.5"])).unwrap();
+        assert_eq!(o.credentials, PathBuf::from("/x/c"));
+    }
+
+    #[test]
+    fn rejects_missing_values_and_strays() {
+        for bad in [
+            &["10.0.0.5", "--credentials-file"][..],
+            &["--credentials-file", "--other", "10.0.0.5"],
+            &["--credentials-file"],
+            &["10.0.0.5", "--bogus"],
+            &["10.0.0.5", "10.0.0.6"],
+            &[
+                "--credentials-file",
+                "a",
+                "--credentials-file",
+                "b",
+                "10.0.0.5",
+            ],
+            &[],
+        ] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+        }
     }
 }

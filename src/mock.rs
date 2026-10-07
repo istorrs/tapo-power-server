@@ -68,10 +68,19 @@ pub struct MockState {
     pub shares: u32,
     /// Omit the wrapped child `error_code` from switch replies.
     pub omit_child_error_code: bool,
+    /// Override the `sum` reported in child lists.
+    pub child_list_sum: Option<u64>,
+    /// Leave `sum` out of child lists.
+    pub omit_child_sum: bool,
     /// Make switch replies report this error code for the wrapped child.
     pub child_error_code: Option<i64>,
     /// Answer the next authenticated request with a forged *plaintext* success.
     pub inject_plain_success: bool,
+    /// Sequence number the device announces at login (default `START_SEQ`).
+    pub start_seq: Option<u32>,
+    /// Answer the next request with the previous (stale) encrypted reply.
+    pub replay_previous_reply: bool,
+    last_reply: Option<Vec<u8>>,
     // handshake scratch
     pending: Option<Pending>,
     session: Option<DevSession>,
@@ -234,13 +243,14 @@ fn login(st: &mut MockState, params: &Value) -> Value {
             }
             st.handshakes += 1;
             let id = format!("SESSION{}+/=", st.handshakes);
+            let start = st.start_seq.unwrap_or(START_SEQ);
             st.session = Some(DevSession {
                 id: id.clone(),
                 shared: shared.to_vec(),
-                expected_seq: START_SEQ,
+                expected_seq: start,
             });
             ok(
-                json!({"dev_confirm": B64.encode(spake::hmac_sha256(&kc_b, &l_enc)), "sessionId": id, "start_seq": START_SEQ}),
+                json!({"dev_confirm": B64.encode(spake::hmac_sha256(&kc_b, &l_enc)), "sessionId": id, "start_seq": start}),
             )
         }
         _ => code(-1),
@@ -283,6 +293,12 @@ fn ds(st: &mut MockState, path: &str, body: &[u8]) -> (axum::http::StatusCode, V
     let (_, sealed) = Session::new(&shared, seq)
         .encrypt_request(reply.to_string().as_bytes())
         .unwrap();
+    if std::mem::take(&mut st.replay_previous_reply)
+        && let Some(stale) = st.last_reply.clone()
+    {
+        return (StatusCode::OK, stale);
+    }
+    st.last_reply = Some(sealed.clone());
     (StatusCode::OK, sealed)
 }
 
@@ -296,13 +312,19 @@ fn command(st: &mut MockState, req: &Value) -> Value {
     match method.as_str() {
         "get_device_info" => ok(json!({"model": "P316M", "device_on": true})),
         "get_child_device_list" => {
+            let start = req["params"]["start_index"].as_u64().unwrap_or(0) as usize;
             let list: Vec<Value> = st
                 .outlets
                 .iter()
                 .enumerate()
+                .skip(start)
                 .map(|(i, on)| json!({"device_id": child_id(i), "position": i + 1, "device_on": on, "nickname": format!("Plug {}", i + 1)}))
                 .collect();
-            ok(json!({"child_device_list": list, "start_index": 0, "sum": 6}))
+            let mut result = json!({"child_device_list": list, "start_index": start});
+            if !st.omit_child_sum {
+                result["sum"] = json!(st.child_list_sum.unwrap_or(6));
+            }
+            ok(result)
         }
         "control_child" => {
             let id = req["params"]["device_id"].as_str().unwrap_or("");

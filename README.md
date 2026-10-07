@@ -95,7 +95,12 @@ the server is deliberately conservative:
   it is restarted. Any answer from the device, even an HTTP error, resets the
   count.
 - State-changing requests run to completion even if the HTTP client
-  disconnects, so a `/sequence` is never abandoned half-way.
+  disconnects, so a `/sequence` is never abandoned half-way. On SIGTERM or
+  Ctrl-C the server stops accepting requests but waits for such in-flight
+  operations to finish before exiting.
+- Replies must answer the request they are sent for: a response sealed under a
+  different sequence number (a replay) is rejected, and a plaintext reply is
+  only accepted as an error.
 
 ## HTTP API
 

@@ -18,6 +18,7 @@ const MAX_HOLD_MS: u64 = 3_600_000;
 /// Cap on the summed holds of one sequence, since it holds the operation lock.
 const MAX_TOTAL_HOLD_MS: u64 = 3_600_000;
 const MAX_STEPS: usize = 1000;
+const MAX_CHILDREN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Child {
@@ -105,9 +106,13 @@ impl Strip {
         &self.client
     }
 
-    /// Fetch the child list (paged until `sum` entries are collected).
+    /// Fetch the child list, following pages until the reported `sum` entries
+    /// are collected. A reply that lacks `child_device_list` or `sum`, or a list
+    /// that ends early or overshoots, is an error: a partial list would
+    /// otherwise replace the port -> device mapping.
     async fn fetch_children(&self) -> Result<Vec<Child>, TapoError> {
         let mut raw: Vec<Value> = Vec::new();
+        let mut total: Option<usize> = None;
         loop {
             let params = (!raw.is_empty()).then(|| json!({ "start_index": raw.len() }));
             let reply = self
@@ -115,18 +120,38 @@ impl Strip {
                 .request(&self.client.envelope("get_child_device_list", params))
                 .await?;
             let result = &reply["result"];
-            let page = result["child_device_list"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let sum = result["sum"].as_u64().unwrap_or(0) as usize;
-            let got = page.len();
-            raw.extend(page);
-            if got == 0 || raw.len() >= sum || raw.len() >= 64 {
-                break;
+            let page = result
+                .get("child_device_list")
+                .and_then(Value::as_array)
+                .ok_or_else(|| TapoError::Protocol("reply has no `child_device_list`".into()))?;
+            let sum = result
+                .get("sum")
+                .and_then(Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n <= MAX_CHILDREN)
+                .ok_or_else(|| TapoError::Protocol("reply has no valid `sum`".into()))?;
+            if *total.get_or_insert(sum) != sum {
+                return Err(TapoError::Protocol(
+                    "child count changed while paging".into(),
+                ));
+            }
+            if page.is_empty() && raw.len() < sum {
+                return Err(TapoError::Protocol(format!(
+                    "child list ended at {} of {sum} entries",
+                    raw.len()
+                )));
+            }
+            raw.extend(page.iter().cloned());
+            if raw.len() > sum {
+                return Err(TapoError::Protocol(format!(
+                    "device returned {} children but reported {sum}",
+                    raw.len()
+                )));
+            }
+            if raw.len() == sum {
+                return parse_children(&raw);
             }
         }
-        parse_children(&raw)
     }
 
     async fn refresh(&self, cache: &mut HashMap<u8, String>) -> Result<Vec<Child>, TapoError> {
@@ -348,6 +373,35 @@ mod tests {
         dev.state.lock().unwrap().omit_child_error_code = true;
         let err = strip.set(3, true).await.unwrap_err();
         assert!(matches!(err, TapoError::Protocol(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_malformed_child_lists_are_errors() {
+        let (dev, strip) = strip().await;
+        assert_eq!(strip.states().await.unwrap().len(), 6);
+
+        // The device claims seven children but only has six.
+        dev.state.lock().unwrap().child_list_sum = Some(7);
+        let err = strip.states().await.unwrap_err();
+        assert!(err.to_string().contains("ended at 6 of 7"), "{err}");
+
+        // Fewer reported than returned.
+        dev.state.lock().unwrap().child_list_sum = Some(5);
+        let err = strip.states().await.unwrap_err();
+        assert!(err.to_string().contains("reported 5"), "{err}");
+
+        // No `sum` at all.
+        {
+            let mut st = dev.state.lock().unwrap();
+            st.child_list_sum = None;
+            st.omit_child_sum = true;
+        }
+        let err = strip.states().await.unwrap_err();
+        assert!(err.to_string().contains("sum"), "{err}");
+
+        // None of that corrupted the cache: a healthy reply works again.
+        dev.state.lock().unwrap().omit_child_sum = false;
+        assert!(strip.set(3, true).await.unwrap());
     }
 
     #[tokio::test]

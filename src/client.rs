@@ -30,7 +30,12 @@ const MAX_UNRESOLVED_PROOFS: u8 = 3;
 
 impl From<SessionError> for TapoError {
     fn from(e: SessionError) -> Self {
-        Self::Protocol(e.to_string())
+        match e {
+            // The counter is never wrapped (that would reuse a nonce); a fresh
+            // session is the only way forward.
+            SessionError::SequenceExhausted => Self::SessionExpired(e.to_string()),
+            other => Self::Protocol(other.to_string()),
+        }
     }
 }
 
@@ -493,6 +498,8 @@ impl TpapClient {
         // future or a lost reply still leaves a record; any answer from the
         // device (even an HTTP error) resolves it.
         guard.unresolved_proofs = guard.unresolved_proofs.saturating_add(1);
+        // Slow earlier stages (PBKDF2, a slow device) must not use up the window.
+        guard.cooldown_until = Some(Instant::now() + self.config.login_cooldown);
         let sent = self.post_login(&disc.base_url, "pake_share", share).await;
         if !matches!(sent, Err(TapoError::Transport(_))) {
             guard.unresolved_proofs = 0;
@@ -957,5 +964,40 @@ mod tests {
             1,
             "no re-login for a non-session error"
         );
+    }
+
+    #[tokio::test]
+    async fn exhausted_sequence_numbers_trigger_a_fresh_session() {
+        let dev = MockDevice::start(MockConfig::default()).await;
+        // The device hands out a session with only two usable sequence numbers.
+        dev.state.lock().unwrap().start_seq = Some(u32::MAX - 2);
+        let client = client_for(quick_config(&dev, 0));
+        let cmd = client.envelope("get_device_info", None);
+
+        client.request(&cmd).await.unwrap();
+        client.request(&cmd).await.unwrap();
+        assert_eq!(dev.state.lock().unwrap().handshakes, 1);
+
+        // The third request finds the counter exhausted, re-handshakes once and
+        // succeeds, instead of leaving a dead session installed.
+        client.request(&cmd).await.unwrap();
+        assert_eq!(dev.state.lock().unwrap().handshakes, 2);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_reply_is_not_accepted_as_an_answer() {
+        // Covered at the session layer; here we check the client surfaces it as
+        // a protocol error rather than a success.
+        let (dev, client) = setup(MockConfig::default(), "correct horse").await;
+        client
+            .request(&client.envelope("get_device_info", None))
+            .await
+            .unwrap();
+        dev.state.lock().unwrap().replay_previous_reply = true;
+        let err = client
+            .request(&client.envelope("get_device_info", None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TapoError::Protocol(_)), "{err}");
     }
 }

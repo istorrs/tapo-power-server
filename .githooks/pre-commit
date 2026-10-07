@@ -18,12 +18,14 @@ fi
 
 # 2. Refuse obvious secret material in what is being added.
 added="$(git diff --cached -U0 --no-color | grep -E '^\+' | grep -Ev '^\+\+\+' || true)"
-if printf '%s\n' "$added" | grep -Eq -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' -e 'gh[pousr]_[A-Za-z0-9]{36,}' -e 'github_pat_[A-Za-z0-9_]{40,}'; then
+# (No `grep -q` anywhere below: with `pipefail`, grep exiting early on a match makes
+# the writer die of SIGPIPE and the whole pipeline report failure. Consume all input.)
+if printf '%s\n' "$added" | grep -E -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' -e 'gh[pousr]_[A-Za-z0-9]{36,}' -e 'github_pat_[A-Za-z0-9_]{40,}' >/dev/null; then
     fail "staged changes contain what looks like a private key or access token"
 fi
 
 # 3. Rust checks, only when Rust or build files changed.
-if printf '%s\n' "$staged" | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^pyproject\.toml$'; then
+if printf '%s\n' "$staged" | grep -E '\.rs$|(^|/)Cargo\.(toml|lock)$|^pyproject\.toml$' >/dev/null; then
     command -v cargo >/dev/null || fail "cargo not found"
     echo "pre-commit: cargo fmt --check"
     cargo fmt --check || fail "formatting differs; run 'cargo fmt' and re-stage"

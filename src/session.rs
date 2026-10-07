@@ -29,6 +29,8 @@ pub enum SessionError {
     Encrypt,
     #[error("request sequence number exhausted")]
     SequenceExhausted,
+    #[error("reply is bound to a different request (stale or replayed)")]
+    Stale,
 }
 
 /// A decoded device reply.
@@ -126,12 +128,13 @@ impl Session {
             return Err(SessionError::TooShort);
         }
         let response_seq = u32::from_be_bytes(body[..4].try_into().expect("4 bytes"));
-        // A zero response sequence means "same as the request".
-        let seq = if response_seq == 0 {
-            request_seq
-        } else {
-            response_seq
-        };
+        // A zero response sequence means "same as the request". Any other value
+        // must equal the request's: a reply sealed under an earlier sequence is a
+        // replay, and must not be accepted as the answer to this request.
+        if response_seq != 0 && response_seq != request_seq {
+            return Err(SessionError::Stale);
+        }
+        let seq = request_seq;
         let nonce = nonce_for(&self.base_nonce, seq);
         let cipher = Aes128Ccm::new_from_slice(self.key.as_slice()).expect("16-byte key");
         let plain = cipher
@@ -217,7 +220,7 @@ mod tests {
         // The device encrypts replies the same way; reuse encrypt_request.
         let (seq, body) = dev.encrypt_request(br#"{"error_code":0}"#).unwrap();
         assert_eq!(
-            client.decrypt_response(&body, 999).unwrap(),
+            client.decrypt_response(&body, seq).unwrap(),
             Reply::Decrypted(br#"{"error_code":0}"#.to_vec())
         );
         // A zero response sequence falls back to the request sequence: the
@@ -260,6 +263,27 @@ mod tests {
     fn truncated_json_looking_body_is_not_plaintext() {
         let s = Session::new(&shared_key(), 0);
         assert!(s.decrypt_response(br#"{"error_code":"#, 1).is_err());
+    }
+
+    #[test]
+    fn replayed_reply_from_an_earlier_request_is_rejected() {
+        let mut dev = Session::new(&shared_key(), 5);
+        let client = Session::new(&shared_key(), 5);
+        let (old_seq, old_reply) = dev
+            .encrypt_request(br#"{"error_code":0,"result":{"device_on":true}}"#)
+            .unwrap();
+        // The same bytes are fine for the request they answer...
+        assert!(client.decrypt_response(&old_reply, old_seq).is_ok());
+        // ...but not as the answer to any later request.
+        for later in [old_seq + 1, old_seq + 7, u32::MAX] {
+            assert!(
+                matches!(
+                    client.decrypt_response(&old_reply, later),
+                    Err(SessionError::Stale)
+                ),
+                "request {later}"
+            );
+        }
     }
 
     #[test]
