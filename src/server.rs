@@ -52,14 +52,19 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-fn error_response(e: &TapoError) -> Response {
-    let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
-        status,
-        axum::Json(json!({"error": e.to_string(), "error_type": e.error_type()})),
-    )
-        .into_response()
+impl IntoResponse for TapoError {
+    fn into_response(self) -> Response {
+        let status =
+            StatusCode::from_u16(self.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (
+            status,
+            axum::Json(json!({"error": self.to_string(), "error_type": self.error_type()})),
+        )
+            .into_response()
+    }
 }
+
+type Reply = Result<Response, TapoError>;
 
 fn ok(result: Value) -> Response {
     axum::Json(json!({ "result": result })).into_response()
@@ -67,6 +72,22 @@ fn ok(result: Value) -> Response {
 
 fn bad(msg: impl Into<String>) -> TapoError {
     TapoError::InvalidArgument(msg.into())
+}
+
+/// Run a device operation to completion even if the HTTP client goes away.
+///
+/// axum drops a handler's future when the connection closes. A sequence
+/// abandoned halfway could leave an outlet in an intermediate state (a device
+/// held in reset, say), and an interrupted login could confuse the lockout
+/// guard, so device work runs in its own task.
+async fn detached<T, F>(fut: F) -> Result<T, TapoError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, TapoError>> + Send + 'static,
+{
+    tokio::spawn(fut)
+        .await
+        .map_err(|e| TapoError::Protocol(format!("operation task failed: {e}")))?
 }
 
 async fn require_token(
@@ -114,47 +135,43 @@ fn parse_json(body: &Bytes) -> Result<Value, TapoError> {
     }
 }
 
-async fn switch(state: &AppState, body: &Bytes, on: bool) -> Result<Response, TapoError> {
-    let port = int_field(&parse_json(body)?, "port")?;
-    Ok(ok(json!(state.strip.set(port, on).await?)))
+async fn switch(state: AppState, body: Bytes, on: bool) -> Reply {
+    let port = int_field(&parse_json(&body)?, "port")?;
+    let strip = state.strip.clone();
+    let new_state = detached(async move { strip.set(port, on).await }).await?;
+    Ok(ok(json!(new_state)))
 }
 
-async fn turn_on(State(state): State<AppState>, body: Bytes) -> Response {
-    switch(&state, &body, true)
-        .await
-        .unwrap_or_else(|e| error_response(&e))
+async fn turn_on(State(state): State<AppState>, body: Bytes) -> Reply {
+    switch(state, body, true).await
 }
 
-async fn turn_off(State(state): State<AppState>, body: Bytes) -> Response {
-    switch(&state, &body, false)
-        .await
-        .unwrap_or_else(|e| error_response(&e))
+async fn turn_off(State(state): State<AppState>, body: Bytes) -> Reply {
+    switch(state, body, false).await
 }
 
-async fn toggle(State(state): State<AppState>, body: Bytes) -> Response {
-    let run = async {
-        let port = int_field(&parse_json(&body)?, "port")?;
-        Ok(ok(json!(state.strip.toggle(port).await?)))
-    };
-    run.await.unwrap_or_else(|e: TapoError| error_response(&e))
+async fn toggle(State(state): State<AppState>, body: Bytes) -> Reply {
+    let port = int_field(&parse_json(&body)?, "port")?;
+    let strip = state.strip.clone();
+    let new_state = detached(async move { strip.toggle(port).await }).await?;
+    Ok(ok(json!(new_state)))
 }
 
 async fn get_state(
     State(state): State<AppState>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
-) -> Response {
-    let run = async {
-        let port = query
-            .as_deref()
-            .unwrap_or("")
-            .split('&')
-            .find_map(|kv| kv.strip_prefix("port="))
-            .ok_or_else(|| bad("missing `port` query parameter"))?
-            .parse::<i64>()
-            .map_err(|_| bad("`port` must be an integer"))?;
-        Ok(ok(json!(state.strip.state(port).await?)))
-    };
-    run.await.unwrap_or_else(|e: TapoError| error_response(&e))
+) -> Reply {
+    let port = query
+        .as_deref()
+        .unwrap_or("")
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("port="))
+        .ok_or_else(|| bad("missing `port` query parameter"))?
+        .parse::<i64>()
+        .map_err(|_| bad("`port` must be an integer"))?;
+    let strip = state.strip.clone();
+    let current = detached(async move { strip.state(port).await }).await?;
+    Ok(ok(json!(current)))
 }
 
 fn parse_steps(v: &Value) -> Result<Vec<Step>, TapoError> {
@@ -185,15 +202,13 @@ fn parse_steps(v: &Value) -> Result<Vec<Step>, TapoError> {
         .collect()
 }
 
-async fn sequence(State(state): State<AppState>, body: Bytes) -> Response {
-    let run = async {
-        let v = parse_json(&body)?;
-        let port = int_field(&v, "port")?;
-        let steps = parse_steps(&v)?;
-        let (count, last) = state.strip.sequence(port, &steps).await?;
-        Ok(ok(json!({"ok": true, "steps": count, "last_result": last})))
-    };
-    run.await.unwrap_or_else(|e: TapoError| error_response(&e))
+async fn sequence(State(state): State<AppState>, body: Bytes) -> Reply {
+    let v = parse_json(&body)?;
+    let port = int_field(&v, "port")?;
+    let steps = parse_steps(&v)?;
+    let strip = state.strip.clone();
+    let (count, last) = detached(async move { strip.sequence(port, &steps).await }).await?;
+    Ok(ok(json!({"ok": true, "steps": count, "last_result": last})))
 }
 
 #[cfg(test)]
@@ -339,6 +354,29 @@ mod tests {
         ] {
             assert_eq!(h.post("/sequence", bad_body).await.0, 400, "{bad_body}");
         }
+    }
+
+    #[tokio::test]
+    async fn sequence_completes_even_if_the_client_disconnects() {
+        let h = start(None, "correct horse").await;
+        // The client gives up after 100 ms; the sequence needs about 400 ms.
+        let impatient = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let body = r#"{"port": 4, "steps": [{"state":"on","hold_ms":200},{"state":"off","hold_ms":200},{"state":"on"}]}"#;
+        let result = impatient
+            .post(format!("{}/sequence", h.base))
+            .body(body)
+            .send()
+            .await;
+        assert!(result.is_err(), "client should have timed out");
+
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let st = h.dev.state.lock().unwrap();
+        let sets: Vec<&String> = st.log.iter().filter(|l| l.starts_with("set")).collect();
+        assert_eq!(sets, ["set 4 true", "set 4 false", "set 4 true"]);
+        assert!(st.outlets[3], "sequence ran to its final step");
     }
 
     #[tokio::test]

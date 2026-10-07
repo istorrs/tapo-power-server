@@ -13,7 +13,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
-use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -45,6 +44,10 @@ pub struct ClientConfig {
     pub port: u16,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    /// After a login-bearing request is sent, no new handshake is started for
+    /// this long unless the previous one succeeded. Guards against hammering
+    /// the device (which locks out) after transient failures or interruptions.
+    pub login_cooldown: Duration,
 }
 
 impl ClientConfig {
@@ -54,6 +57,7 @@ impl ClientConfig {
             port: 80,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(15),
+            login_cooldown: Duration::from_secs(30),
         }
     }
 }
@@ -65,8 +69,11 @@ struct Live {
 
 struct Inner {
     live: Option<Live>,
-    /// Set after a login rejection; no further handshakes are attempted.
+    /// Set after the device rejects a login; no further handshakes are attempted.
     login_blocked: Option<String>,
+    /// Set before a login-bearing request is sent and cleared on success, so a
+    /// failed *or interrupted* (future dropped) attempt is never retried at once.
+    cooldown_until: Option<Instant>,
     last_activity: Instant,
 }
 
@@ -190,6 +197,7 @@ impl TpapClient {
             inner: Mutex::new(Inner {
                 live: None,
                 login_blocked: None,
+                cooldown_until: None,
                 last_activity: Instant::now(),
             }),
         })
@@ -252,17 +260,26 @@ impl TpapClient {
                 "login disabled after an earlier failure ({reason}); fix the problem and restart"
             )));
         }
+        if let Some(until) = inner.cooldown_until {
+            let now = Instant::now();
+            if now < until {
+                return Err(TapoError::Protocol(format!(
+                    "an earlier login attempt failed or was interrupted; not retrying for {}s",
+                    (until - now).as_secs() + 1
+                )));
+            }
+        }
         inner.live = None;
-        let mut attempted = false;
-        match self.handshake_inner(&mut attempted).await {
+        match self.handshake_inner(&mut inner.cooldown_until).await {
             Ok(live) => {
                 inner.live = Some(live);
+                inner.cooldown_until = None;
                 inner.last_activity = Instant::now();
                 Ok(())
             }
             Err(e) => {
-                let transport = matches!(e, TapoError::Transport(_));
-                if attempted && !transport {
+                // Only a genuine rejection latches; anything else just cools down.
+                if matches!(e, TapoError::Authentication(_)) {
                     inner.login_blocked = Some(e.to_string());
                 }
                 Err(e)
@@ -340,12 +357,16 @@ impl TpapClient {
         })
     }
 
-    /// One handshake attempt. `attempted` is set once a login-bearing request
-    /// (`pake_register`) has been sent.
-    async fn handshake_inner(&self, attempted: &mut bool) -> Result<Live, TapoError> {
+    /// One handshake attempt. `cooldown` is armed just before the first
+    /// login-bearing request (`pake_register`) is sent.
+    async fn handshake_inner(&self, cooldown: &mut Option<Instant>) -> Result<Live, TapoError> {
         let disc = self.discover().await?;
 
-        let passcode_type = if disc.pake.contains(&0) {
+        // Prefer the account-password type when offered, even if the device also
+        // offers passcode types this implementation does not handle.
+        let passcode_type = if disc.pake.iter().any(|p| matches!(p, 1 | 2 | 5)) {
+            "userpw"
+        } else if disc.pake.contains(&0) {
             return Err(TapoError::Unsupported(
                 "device offers the MAC-derived default passcode only; not implemented".into(),
             ));
@@ -353,8 +374,6 @@ impl TpapClient {
             return Err(TapoError::Unsupported(
                 "shared_token passcode type is not implemented".into(),
             ));
-        } else if disc.pake.iter().any(|p| matches!(p, 1 | 2 | 5)) {
-            "userpw"
         } else {
             return Err(TapoError::Unsupported(format!(
                 "no supported passcode type in {:?}",
@@ -369,7 +388,7 @@ impl TpapClient {
             md5_hex("admin")
         };
 
-        *attempted = true;
+        *cooldown = Some(Instant::now() + self.config.login_cooldown);
         let reg = self
             .post_login(
                 &disc.base_url,
@@ -422,7 +441,13 @@ impl TpapClient {
             self.credentials.password(),
             &disc.mac_no_sep,
         ));
-        let w = spake::derive_w(credential_string.as_bytes(), &dev_salt, iterations)?;
+        // PBKDF2 with a device-chosen iteration count is CPU-bound: keep it off the
+        // async workers so /health and other routes stay responsive.
+        let w = tokio::task::spawn_blocking(move || {
+            spake::derive_w(credential_string.as_bytes(), &dev_salt, iterations)
+        })
+        .await
+        .map_err(|_| TapoError::Protocol("key derivation task failed".into()))??;
         let x = spake::random_scalar()?;
         let hs = spake::finish(&x, &w, &user_random, &dev_random, &dev_share)?;
 
@@ -437,7 +462,7 @@ impl TpapClient {
         let done = self.post_login(&disc.base_url, "pake_share", share).await?;
 
         let dev_confirm = b64(&done, "dev_confirm")?;
-        if !bool::from(dev_confirm.ct_eq(&hs.expected_dev_confirm)) {
+        if !hs.verify_dev_confirm(&dev_confirm) {
             return Err(TapoError::Protocol(
                 "device confirmation did not match".into(),
             ));
@@ -722,5 +747,83 @@ mod tests {
             !request.contains("content-length"),
             "request was: {request}"
         );
+    }
+
+    fn quick_config(dev: &MockDevice, cooldown_ms: u64) -> ClientConfig {
+        let mut config = ClientConfig::new("127.0.0.1");
+        config.port = dev.addr.port();
+        config.login_cooldown = Duration::from_millis(cooldown_ms);
+        config
+    }
+
+    fn client_for(config: ClientConfig) -> TpapClient {
+        let creds = Credentials::new("user@example.com".into(), "correct horse".into()).unwrap();
+        TpapClient::new(config, creds).unwrap()
+    }
+
+    #[tokio::test]
+    async fn transient_failure_cools_down_then_recovers_without_latching() {
+        let dev = MockDevice::start(MockConfig::default()).await;
+        let client = client_for(quick_config(&dev, 300));
+        dev.state.lock().unwrap().fail_next_share_http = true;
+
+        let first = client
+            .request(&client.envelope("get_device_info", None))
+            .await
+            .unwrap_err();
+        assert!(matches!(first, TapoError::Protocol(_)), "{first}");
+        let registers = dev.state.lock().unwrap().registers;
+
+        // Immediately afterwards the device is left alone...
+        let second = client
+            .request(&client.envelope("get_device_info", None))
+            .await
+            .unwrap_err();
+        assert!(second.to_string().contains("not retrying"), "{second}");
+        assert_eq!(dev.state.lock().unwrap().registers, registers);
+
+        // ...but the failure was not permanent.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        client
+            .request(&client.envelope("get_device_info", None))
+            .await
+            .unwrap();
+        assert_eq!(dev.state.lock().unwrap().handshakes, 1);
+    }
+
+    #[tokio::test]
+    async fn interrupted_login_is_not_retried_immediately() {
+        let dev = MockDevice::start(MockConfig::default()).await;
+        dev.state.lock().unwrap().stall_register = true;
+        let client = client_for(quick_config(&dev, 60_000));
+
+        // The caller gives up while pake_register is outstanding: the request
+        // future is dropped mid-handshake.
+        let cmd = client.envelope("get_device_info", None);
+        let outcome = tokio::time::timeout(Duration::from_millis(300), client.request(&cmd)).await;
+        assert!(outcome.is_err(), "request should have been cancelled");
+        assert_eq!(dev.state.lock().unwrap().registers, 1);
+
+        dev.state.lock().unwrap().stall_register = false;
+        let err = client.request(&cmd).await.unwrap_err();
+        assert!(err.to_string().contains("not retrying"), "{err}");
+        assert_eq!(
+            dev.state.lock().unwrap().registers,
+            1,
+            "no second login attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefers_supported_passcode_type_when_default_is_also_offered() {
+        let cfg = MockConfig {
+            pake: vec![0, 2],
+            ..Default::default()
+        };
+        let (_dev, client) = setup(cfg, "correct horse").await;
+        client
+            .request(&client.envelope("get_device_info", None))
+            .await
+            .unwrap();
     }
 }

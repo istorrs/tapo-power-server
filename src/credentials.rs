@@ -16,6 +16,8 @@ pub enum CredentialsError {
     Read(String),
     #[error("credentials file {0} is accessible by other users; run `chmod 600` on it")]
     Permissions(String),
+    #[error("credentials file line {0} is not `KEY=VALUE`")]
+    Malformed(usize),
     #[error("credentials are missing `{0}`")]
     Missing(&'static str),
     #[error("credentials still contain the placeholder values; edit the file first")]
@@ -80,15 +82,22 @@ impl Credentials {
         Self::parse(&text)
     }
 
+    /// Parse `KEY=VALUE` lines. Blank lines and `#` comments are skipped, an
+    /// optional leading `export ` is accepted, unknown keys are ignored, and
+    /// one pair of matching surrounding quotes is stripped from a value (so a
+    /// password that itself starts and ends with a quote must be wrapped in
+    /// another pair). Anything else is rejected rather than silently skipped,
+    /// because a misread credential costs a login attempt.
     pub fn parse(text: &str) -> Result<Self, CredentialsError> {
         let (mut email, mut password) = (None, None);
-        for line in text.lines() {
+        for (n, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            let line = line.strip_prefix("export ").unwrap_or(line);
             let Some((key, value)) = line.split_once('=') else {
-                continue;
+                return Err(CredentialsError::Malformed(n + 1));
             };
             let value = unquote(value.trim());
             match key.trim() {
@@ -132,6 +141,19 @@ mod tests {
             .unwrap();
         assert_eq!(c.email(), "a@b.c");
         assert_eq!(c.password(), "p w=1");
+    }
+
+    #[test]
+    fn accepts_export_prefix_and_rejects_malformed_lines() {
+        let c = Credentials::parse("export TAPO_EMAIL=a@b.c\nexport TAPO_PASSWORD='pw'\n").unwrap();
+        assert_eq!((c.email(), c.password()), ("a@b.c", "pw"));
+        // A line without `=` is an error that names the line but never its content.
+        let err = Credentials::parse("TAPO_EMAIL=a@b.c\nhunter2\nTAPO_PASSWORD=x\n").unwrap_err();
+        assert!(matches!(err, CredentialsError::Malformed(2)));
+        assert!(!err.to_string().contains("hunter2"));
+        // A password that is itself quoted needs a second pair.
+        let c = Credentials::parse("TAPO_EMAIL=a@b.c\nTAPO_PASSWORD=\"'q'\"\n").unwrap();
+        assert_eq!(c.password(), "'q'");
     }
 
     #[test]

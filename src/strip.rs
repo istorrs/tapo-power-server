@@ -15,6 +15,8 @@ use crate::{client::TpapClient, error::TapoError};
 
 pub const PORT_COUNT: u8 = 6;
 const MAX_HOLD_MS: u64 = 3_600_000;
+/// Cap on the summed holds of one sequence, since it holds the operation lock.
+const MAX_TOTAL_HOLD_MS: u64 = 3_600_000;
 const MAX_STEPS: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +215,16 @@ impl Strip {
                 "hold_ms must be at most {MAX_HOLD_MS}"
             )));
         }
+        // The last step's hold is never waited out, so it does not count.
+        let total: u64 = steps[..steps.len() - 1]
+            .iter()
+            .filter_map(|s| s.hold_ms)
+            .sum();
+        if total > MAX_TOTAL_HOLD_MS {
+            return Err(TapoError::InvalidArgument(format!(
+                "total hold time must be at most {MAX_TOTAL_HOLD_MS} ms"
+            )));
+        }
         let mut cache = self.op.lock().await;
         let mut last = None;
         for (i, step) in steps.iter().enumerate() {
@@ -320,6 +332,22 @@ mod tests {
             strip.sequence(2, &too_long).await,
             Err(TapoError::InvalidArgument(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn sequence_total_hold_is_capped() {
+        let (dev, strip) = strip().await;
+        let steps: Vec<Step> = (0..5)
+            .map(|_| Step {
+                on: true,
+                hold_ms: Some(MAX_HOLD_MS),
+            })
+            .collect();
+        assert!(matches!(
+            strip.sequence(2, &steps).await,
+            Err(TapoError::InvalidArgument(_))
+        ));
+        assert_eq!(dev.state.lock().unwrap().handshakes, 0);
     }
 
     #[tokio::test]

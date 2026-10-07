@@ -70,12 +70,27 @@ repository (for example `~/.config/tapo-power-server/credentials`, mode
 `0600`); the server refuses a group- or world-readable file, and refuses the
 placeholder values.
 
-**Login lockout safety.** The device counts failed logins and locks out. The
-server makes exactly one login attempt per handshake; after the device
-rejects a login it stops contacting the device entirely and answers device
-routes with errors until you fix the credentials and restart it. It does not
-exit on a rejected login, so a supervisor such as systemd will not keep
-retrying the login. Transport errors (device offline) do not disable login.
+**Credentials file format.** `KEY=VALUE` lines (`TAPO_EMAIL`, `TAPO_PASSWORD`);
+blank lines and `#` comments are skipped, a leading `export ` is accepted, and
+unknown keys are ignored. One pair of matching surrounding quotes is stripped
+from a value, so a password that itself starts and ends with a quote must be
+wrapped in another pair. A line that is not `KEY=VALUE` is an error (reported
+by line number, never by content) rather than being silently skipped.
+
+**Login lockout safety.** The device counts failed logins and locks out, so
+the server is deliberately conservative:
+
+- Each handshake makes exactly one login attempt.
+- If the device **rejects** a login, the server stops contacting the device
+  entirely and answers device routes with errors until you fix the
+  credentials and restart it. It does not exit, so a supervisor such as
+  systemd will not keep retrying the login.
+- Any other failure after the login starts (an HTTP error, a malformed
+  reply, a dropped connection) or an interrupted attempt starts a 30-second
+  cooldown during which no new login is tried; after that, it retries.
+  Failures before the login starts (device offline) do not trigger it.
+- State-changing requests run to completion even if the HTTP client
+  disconnects, so a `/sequence` is never abandoned half-way.
 
 ## HTTP API
 

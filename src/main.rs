@@ -1,6 +1,6 @@
 //! tapo-power-server: HTTP power-control server for TPAP Tapo power strips.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use tapo_power_server::{
@@ -88,36 +88,37 @@ async fn main() {
         }),
     ));
 
-    // Try one login up front so misconfiguration is visible in the logs. A
-    // rejected login does NOT exit: a supervisor restarting the process would
-    // retry the login and could lock the device out. The server stays up and
-    // answers device routes with errors until it is restarted by hand.
-    match strip.client().connect().await {
-        Ok(()) => eprintln!("connected to {}:{}", args.device_host, args.device_port),
-        Err(e @ TapoError::Authentication(_)) => {
-            eprintln!(
-                "ERROR: {e}\nERROR: device routes will fail until the credentials are fixed and the server is restarted"
-            );
-        }
-        Err(e) => eprintln!("warning: initial connection failed ({e}); will retry on demand"),
-    }
-
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port)
-        .parse()
-        .unwrap_or_else(|e| {
-            eprintln!("error: invalid listen address: {e}");
-            std::process::exit(2);
-        });
-    let listener = tokio::net::TcpListener::bind(addr)
+    let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port))
         .await
         .unwrap_or_else(|e| {
-            eprintln!("error: cannot bind {addr}: {e}");
+            eprintln!("error: cannot listen on {}:{}: {e}", args.host, args.port);
             std::process::exit(1);
         });
     eprintln!(
-        "listening on {addr} (auth {})",
+        "listening on {} (auth {})",
+        listener.local_addr().map_or_else(
+            |_| format!("{}:{}", args.host, args.port),
+            |a| a.to_string()
+        ),
         if token.is_some() { "required" } else { "off" }
     );
+
+    // Try one login up front, in the background so the server (and /health)
+    // is available immediately even if the device is slow or offline. A
+    // rejected login does NOT exit: a supervisor restarting the process would
+    // retry the login and could lock the device out. The server stays up and
+    // answers device routes with errors until it is restarted by hand.
+    let initial = strip.clone();
+    let (device_host, device_port) = (args.device_host.clone(), args.device_port);
+    tokio::spawn(async move {
+        match initial.client().connect().await {
+            Ok(()) => eprintln!("connected to {device_host}:{device_port}"),
+            Err(e @ TapoError::Authentication(_)) => eprintln!(
+                "ERROR: {e}\nERROR: device routes will fail until the credentials are fixed and the server is restarted"
+            ),
+            Err(e) => eprintln!("warning: initial connection failed ({e}); will retry on demand"),
+        }
+    });
 
     let app = router(AppState { strip, token });
     if let Err(e) = axum::serve(listener, app)

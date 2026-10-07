@@ -58,6 +58,10 @@ pub struct MockState {
     /// Forget the session (as an idle device does).
     pub drop_session: bool,
     pub saw_dac_nonce: bool,
+    /// Hold `pake_register` replies for a long time (simulates a stuck login).
+    pub stall_register: bool,
+    /// Answer the next `pake_share` with HTTP 503.
+    pub fail_next_share_http: bool,
     // handshake scratch
     pending: Option<Pending>,
     session: Option<DevSession>,
@@ -110,11 +114,30 @@ fn code(c: i64) -> Value {
 }
 
 async fn handle(State(st): State<Shared>, uri: Uri, body: Bytes) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    let parsed: Value = if uri.path() == "/" {
+        serde_json::from_slice(&body).unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let sub = parsed["params"]["sub_method"].as_str().unwrap_or("");
+    let stall = {
+        let mut g = st.lock().unwrap();
+        if sub == "pake_register" {
+            g.registers += 1; // count on arrival, before any stall
+        }
+        sub == "pake_register" && g.stall_register
+    };
+    if stall {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
     let mut st = st.lock().unwrap();
+    if sub == "pake_share" && std::mem::take(&mut st.fail_next_share_http) {
+        return (StatusCode::SERVICE_UNAVAILABLE, vec![]);
+    }
     if uri.path() == "/" {
-        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        let reply = login(&mut st, &v["params"]);
-        return (axum::http::StatusCode::OK, reply.to_string().into_bytes());
+        let reply = login(&mut st, &parsed["params"]);
+        return (StatusCode::OK, reply.to_string().into_bytes());
     }
     ds(&mut st, uri.path(), &body)
 }
@@ -129,7 +152,6 @@ fn login(st: &mut MockState, params: &Value) -> Value {
             )
         }
         "pake_register" => {
-            st.registers += 1;
             let cfg = st.cfg.as_ref().unwrap();
             let credential = build_credentials(
                 cfg.extra_crypt

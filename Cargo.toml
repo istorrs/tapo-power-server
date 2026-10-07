@@ -2,7 +2,7 @@
 name = "tapo-power-server"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 description = "TPAP client and HTTP power-control server for Tapo power strips"
 
