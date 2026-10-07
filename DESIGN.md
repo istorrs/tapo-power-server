@@ -485,8 +485,12 @@ P316M (read-only `login/discover`).
   including `device_id`, `position` (1-6), `device_on`, `nickname` (base64).
   `device_id` is the parent id plus a two-digit index. Switching is
   `control_child` with `requestData` `{"method":"set_device_info","params":{"device_on":bool}}`
-  and works as inferred; the wrapped result carries its own `error_code` under
-  `result.response_data`.
+  and works as inferred. The reply is
+  `{"error_code":0,"result":{"responseData":{"error_code":0}}}`: the wrapped
+  child result is under the camelCase key `responseData` (not `response_data`),
+  and its own `error_code` must be checked. (An earlier note here guessed the
+  snake_case spelling and was wrong; the client now rejects a reply that has no
+  child `error_code` instead of assuming success.)
 - Outlet results in the HTTP API are the resulting on/off state as a boolean.
   pyhil's exact return-value convention for `/turn_on` etc. was not available
   while building this; adjust if the broker expects something else.

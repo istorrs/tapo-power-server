@@ -62,6 +62,16 @@ pub struct MockState {
     pub stall_register: bool,
     /// Answer the next `pake_share` with HTTP 503.
     pub fail_next_share_http: bool,
+    /// Hold `pake_share` replies for a long time (outcome unknown to the client).
+    pub stall_share: bool,
+    /// Number of `pake_share` requests that reached the device.
+    pub shares: u32,
+    /// Omit the wrapped child `error_code` from switch replies.
+    pub omit_child_error_code: bool,
+    /// Make switch replies report this error code for the wrapped child.
+    pub child_error_code: Option<i64>,
+    /// Answer the next authenticated request with a forged *plaintext* success.
+    pub inject_plain_success: bool,
     // handshake scratch
     pending: Option<Pending>,
     session: Option<DevSession>,
@@ -126,7 +136,10 @@ async fn handle(State(st): State<Shared>, uri: Uri, body: Bytes) -> impl IntoRes
         if sub == "pake_register" {
             g.registers += 1; // count on arrival, before any stall
         }
-        sub == "pake_register" && g.stall_register
+        if sub == "pake_share" {
+            g.shares += 1;
+        }
+        (sub == "pake_register" && g.stall_register) || (sub == "pake_share" && g.stall_share)
     };
     if stall {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -259,6 +272,12 @@ fn ds(st: &mut MockState, path: &str, body: &[u8]) -> (axum::http::StatusCode, V
     };
     sess.expected_seq = seq + 1;
     let shared = sess.shared.clone();
+    if std::mem::take(&mut st.inject_plain_success) {
+        return (
+            StatusCode::OK,
+            ok(json!({"model": "forged"})).to_string().into_bytes(),
+        );
+    }
     let req: Value = serde_json::from_slice(&plain).unwrap();
     let reply = command(st, &req);
     let (_, sealed) = Session::new(&shared, seq)
@@ -297,9 +316,15 @@ fn command(st: &mut MockState, req: &Value) -> Value {
             let Some(on) = inner["params"]["device_on"].as_bool() else {
                 return code(-1008);
             };
+            if let Some(c) = st.child_error_code {
+                return ok(json!({"responseData": {"error_code": c}}));
+            }
             st.log.push(format!("set {} {}", i + 1, on));
             st.outlets[i] = on;
-            ok(json!({"response_data": {"result": {}, "error_code": 0}}))
+            if st.omit_child_error_code {
+                return ok(json!({"responseData": {"result": {}}}));
+            }
+            ok(json!({"responseData": {"error_code": 0}}))
         }
         _ => code(-1008),
     }

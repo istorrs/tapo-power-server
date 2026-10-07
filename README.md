@@ -89,6 +89,11 @@ the server is deliberately conservative:
   reply, a dropped connection) or an interrupted attempt starts a 30-second
   cooldown during which no new login is tried; after that, it retries.
   Failures before the login starts (device offline) do not trigger it.
+- If a login proof is sent and no answer ever comes back (timeout, dropped
+  connection, interrupted request), the device may have counted it as a
+  failure. After three such attempts in a row the server disables login until
+  it is restarted. Any answer from the device, even an HTTP error, resets the
+  count.
 - State-changing requests run to completion even if the HTTP client
   disconnects, so a `/sequence` is never abandoned half-way.
 

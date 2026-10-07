@@ -114,7 +114,12 @@ impl Session {
 
     /// Decode a device reply to the request sent with `request_seq`.
     pub fn decrypt_response(&self, body: &[u8], request_seq: u32) -> Result<Reply, SessionError> {
-        if matches!(body.first(), Some(b'{') | Some(b'[')) {
+        // The first byte of an encrypted reply is the top byte of its sequence
+        // number, which may itself be `{` or `[`; only a body that parses as
+        // complete JSON is a plaintext envelope.
+        if matches!(body.first(), Some(b'{') | Some(b'['))
+            && serde_json::from_slice::<serde_json::Value>(body).is_ok()
+        {
             return Ok(Reply::Plain(body.to_vec()));
         }
         if body.len() < 4 + TAG_LEN {
@@ -234,6 +239,27 @@ mod tests {
             s.decrypt_response(br#"{"error_code":-40401}"#, 1).unwrap(),
             Reply::Plain(br#"{"error_code":-40401}"#.to_vec())
         );
+    }
+
+    #[test]
+    fn encrypted_replies_whose_sequence_starts_with_a_json_byte_still_decrypt() {
+        for start in [0x7b00_0064u32, 0x5b00_0064, 0x7bff_ffff, 0x5b00_0000] {
+            let mut dev = Session::new(&shared_key(), start);
+            let client = Session::new(&shared_key(), start);
+            let (seq, body) = dev.encrypt_request(br#"{"error_code":0}"#).unwrap();
+            assert!(matches!(body[0], b'{' | b'['));
+            assert_eq!(
+                client.decrypt_response(&body, seq).unwrap(),
+                Reply::Decrypted(br#"{"error_code":0}"#.to_vec()),
+                "start {start:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_json_looking_body_is_not_plaintext() {
+        let s = Session::new(&shared_key(), 0);
+        assert!(s.decrypt_response(br#"{"error_code":"#, 1).is_err());
     }
 
     #[test]

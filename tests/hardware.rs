@@ -59,10 +59,16 @@ async fn hardware_suite() {
         return;
     }
     let host = std::env::var("TAPO_HOST").expect("TAPO_HOST must be set");
-    let port: i64 = std::env::var("TAPO_HW_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(5);
+    // Default only when the variable is absent. A malformed value must stop the
+    // run before the device is contacted: guessing could switch another outlet.
+    let port: i64 = match std::env::var("TAPO_HW_PORT") {
+        Ok(v) => v
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("TAPO_HW_PORT must be an integer 2-5, got {v:?}")),
+        Err(std::env::VarError::NotPresent) => 5,
+        Err(e) => panic!("cannot read TAPO_HW_PORT: {e}"),
+    };
     assert!(
         ALLOWED_PORTS.contains(&port),
         "TAPO_HW_PORT must be within 2-5"

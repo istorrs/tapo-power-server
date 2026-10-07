@@ -25,6 +25,8 @@ use crate::{
 
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(45);
 const MAX_PBKDF2_ITERATIONS: u32 = 5_000_000;
+/// Login attempts that may end with an unknown outcome before login is disabled.
+const MAX_UNRESOLVED_PROOFS: u8 = 3;
 
 impl From<SessionError> for TapoError {
     fn from(e: SessionError) -> Self {
@@ -48,6 +50,8 @@ pub struct ClientConfig {
     /// this long unless the previous one succeeded. Guards against hammering
     /// the device (which locks out) after transient failures or interruptions.
     pub login_cooldown: Duration,
+    /// Idle time after which a keep-alive request precedes the next command.
+    pub keepalive_after: Duration,
 }
 
 impl ClientConfig {
@@ -58,6 +62,7 @@ impl ClientConfig {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(15),
             login_cooldown: Duration::from_secs(30),
+            keepalive_after: KEEPALIVE_AFTER,
         }
     }
 }
@@ -67,13 +72,24 @@ struct Live {
     ds_url: String,
 }
 
+/// Tracks login attempts whose effect on the device's lockout counter is not
+/// known with certainty.
+#[derive(Default)]
+struct LoginGuard {
+    /// Set before a login-bearing request is sent and cleared on success, so a
+    /// failed *or interrupted* (future dropped) attempt is never retried at once.
+    cooldown_until: Option<Instant>,
+    /// Proofs sent whose outcome never came back (timeout, reset, or the
+    /// request future was dropped). The device may have counted each as a
+    /// failure, so after [`MAX_UNRESOLVED_PROOFS`] login is disabled.
+    unresolved_proofs: u8,
+}
+
 struct Inner {
     live: Option<Live>,
     /// Set after the device rejects a login; no further handshakes are attempted.
     login_blocked: Option<String>,
-    /// Set before a login-bearing request is sent and cleared on success, so a
-    /// failed *or interrupted* (future dropped) attempt is never retried at once.
-    cooldown_until: Option<Instant>,
+    guard: LoginGuard,
     last_activity: Instant,
 }
 
@@ -197,7 +213,7 @@ impl TpapClient {
             inner: Mutex::new(Inner {
                 live: None,
                 login_blocked: None,
-                cooldown_until: None,
+                guard: LoginGuard::default(),
                 last_activity: Instant::now(),
             }),
         })
@@ -244,11 +260,15 @@ impl TpapClient {
         if inner.live.is_none() {
             return self.handshake(inner).await;
         }
-        if inner.last_activity.elapsed() >= KEEPALIVE_AFTER {
+        if inner.last_activity.elapsed() >= self.config.keepalive_after {
             let ping = self.envelope("get_device_info", None);
-            if self.send(inner, &ping).await.is_err() {
-                inner.live = None;
-                return self.handshake(inner).await;
+            match self.send(inner, &ping).await {
+                Ok(_) => {}
+                Err(e) if e.is_session_error() => {
+                    inner.live = None;
+                    return self.handshake(inner).await;
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -260,7 +280,13 @@ impl TpapClient {
                 "login disabled after an earlier failure ({reason}); fix the problem and restart"
             )));
         }
-        if let Some(until) = inner.cooldown_until {
+        if inner.guard.unresolved_proofs >= MAX_UNRESOLVED_PROOFS {
+            return Err(TapoError::Authentication(
+                "login disabled: earlier attempts ended with an unknown outcome; restart to retry"
+                    .into(),
+            ));
+        }
+        if let Some(until) = inner.guard.cooldown_until {
             let now = Instant::now();
             if now < until {
                 return Err(TapoError::Protocol(format!(
@@ -270,10 +296,10 @@ impl TpapClient {
             }
         }
         inner.live = None;
-        match self.handshake_inner(&mut inner.cooldown_until).await {
+        match self.handshake_inner(&mut inner.guard).await {
             Ok(live) => {
                 inner.live = Some(live);
-                inner.cooldown_until = None;
+                inner.guard = LoginGuard::default();
                 inner.last_activity = Instant::now();
                 Ok(())
             }
@@ -281,6 +307,10 @@ impl TpapClient {
                 // Only a genuine rejection latches; anything else just cools down.
                 if matches!(e, TapoError::Authentication(_)) {
                     inner.login_blocked = Some(e.to_string());
+                } else if inner.guard.unresolved_proofs >= MAX_UNRESOLVED_PROOFS {
+                    inner.login_blocked = Some(format!(
+                        "{MAX_UNRESOLVED_PROOFS} login attempts ended with an unknown outcome, so the device may be close to locking out"
+                    ));
                 }
                 Err(e)
             }
@@ -357,9 +387,9 @@ impl TpapClient {
         })
     }
 
-    /// One handshake attempt. `cooldown` is armed just before the first
+    /// One handshake attempt. `guard` is armed just before the first
     /// login-bearing request (`pake_register`) is sent.
-    async fn handshake_inner(&self, cooldown: &mut Option<Instant>) -> Result<Live, TapoError> {
+    async fn handshake_inner(&self, guard: &mut LoginGuard) -> Result<Live, TapoError> {
         let disc = self.discover().await?;
 
         // Prefer the account-password type when offered, even if the device also
@@ -388,7 +418,7 @@ impl TpapClient {
             md5_hex("admin")
         };
 
-        *cooldown = Some(Instant::now() + self.config.login_cooldown);
+        guard.cooldown_until = Some(Instant::now() + self.config.login_cooldown);
         let reg = self
             .post_login(
                 &disc.base_url,
@@ -459,7 +489,15 @@ impl TpapClient {
         if disc.dac {
             share["dac_nonce"] = json!(B64.encode(random_bytes::<16>()?));
         }
-        let done = self.post_login(&disc.base_url, "pake_share", share).await?;
+        // Count the proof as unresolved *before* it leaves, so that a dropped
+        // future or a lost reply still leaves a record; any answer from the
+        // device (even an HTTP error) resolves it.
+        guard.unresolved_proofs = guard.unresolved_proofs.saturating_add(1);
+        let sent = self.post_login(&disc.base_url, "pake_share", share).await;
+        if !matches!(sent, Err(TapoError::Transport(_))) {
+            guard.unresolved_proofs = 0;
+        }
+        let done = sent?;
 
         let dev_confirm = b64(&done, "dev_confirm")?;
         if !hs.verify_dev_confirm(&dev_confirm) {
@@ -507,12 +545,20 @@ impl TpapClient {
             .bytes()
             .await
             .map_err(|e| TapoError::Transport(describe(&e)))?;
-        let json_bytes = match live.session.decrypt_response(&bytes, seq)? {
-            Reply::Plain(b) | Reply::Decrypted(b) => b,
+        let (json_bytes, authenticated) = match live.session.decrypt_response(&bytes, seq)? {
+            Reply::Plain(b) => (b, false),
+            Reply::Decrypted(b) => (b, true),
         };
         let value: Value = serde_json::from_slice(&json_bytes)
             .map_err(|_| TapoError::Protocol("response is not JSON".into()))?;
         check_error_code(&value, "request")?;
+        if !authenticated {
+            // Plaintext is only legitimate for error envelopes. A plaintext
+            // *success* carries no proof of coming from the device.
+            return Err(TapoError::Protocol(
+                "device sent an unauthenticated success reply; ignoring it".into(),
+            ));
+        }
         inner.last_activity = Instant::now();
         Ok(value)
     }
@@ -825,5 +871,91 @@ mod tests {
             .request(&client.envelope("get_device_info", None))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_plaintext_success_is_rejected() {
+        let (dev, client) = setup(MockConfig::default(), "correct horse").await;
+        client
+            .request(&client.envelope("get_device_info", None))
+            .await
+            .unwrap();
+        dev.state.lock().unwrap().inject_plain_success = true;
+        let err = client
+            .request(&client.envelope("get_device_info", None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TapoError::Protocol(_)), "{err}");
+        assert!(err.to_string().contains("unauthenticated"), "{err}");
+        // The session is unharmed and no re-login was needed.
+        client
+            .request(&client.envelope("get_device_info", None))
+            .await
+            .unwrap();
+        assert_eq!(dev.state.lock().unwrap().handshakes, 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_unknown_login_outcomes_disable_login() {
+        let dev = MockDevice::start(MockConfig::default()).await;
+        dev.state.lock().unwrap().stall_share = true;
+        let mut config = quick_config(&dev, 0);
+        config.request_timeout = Duration::from_millis(250);
+        let client = client_for(config);
+        let cmd = client.envelope("get_device_info", None);
+
+        for attempt in 1..=MAX_UNRESOLVED_PROOFS {
+            let err = client.request(&cmd).await.unwrap_err();
+            assert!(
+                matches!(err, TapoError::Transport(_)),
+                "attempt {attempt}: {err}"
+            );
+        }
+        assert_eq!(
+            dev.state.lock().unwrap().shares,
+            u32::from(MAX_UNRESOLVED_PROOFS)
+        );
+
+        // Login is now disabled and the device is left alone.
+        let err = client.request(&cmd).await.unwrap_err();
+        assert!(err.to_string().contains("login disabled"), "{err}");
+        assert_eq!(
+            dev.state.lock().unwrap().shares,
+            u32::from(MAX_UNRESOLVED_PROOFS)
+        );
+    }
+
+    #[tokio::test]
+    async fn answered_proofs_do_not_count_as_unresolved() {
+        // A device that answers (here with HTTP 503) has resolved the attempt,
+        // so many such failures never trip the unknown-outcome limit.
+        let dev = MockDevice::start(MockConfig::default()).await;
+        let client = client_for(quick_config(&dev, 0));
+        let cmd = client.envelope("get_device_info", None);
+        for _ in 0..(MAX_UNRESOLVED_PROOFS + 2) {
+            dev.state.lock().unwrap().fail_next_share_http = true;
+            assert!(client.request(&cmd).await.is_err());
+        }
+        client.request(&cmd).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keepalive_failure_that_is_not_a_session_error_does_not_relogin() {
+        let dev = MockDevice::start(MockConfig::default()).await;
+        let mut config = quick_config(&dev, 0);
+        config.keepalive_after = Duration::ZERO; // every command is preceded by a keep-alive
+        let client = client_for(config);
+        let cmd = client.envelope("get_device_info", None);
+        client.request(&cmd).await.unwrap();
+        assert_eq!(dev.state.lock().unwrap().handshakes, 1);
+
+        dev.state.lock().unwrap().inject_plain_error = Some(-1008);
+        let err = client.request(&cmd).await.unwrap_err();
+        assert!(matches!(err, TapoError::Device { code: -1008 }), "{err}");
+        assert_eq!(
+            dev.state.lock().unwrap().handshakes,
+            1,
+            "no re-login for a non-session error"
+        );
     }
 }

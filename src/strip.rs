@@ -49,27 +49,48 @@ pub fn check_port(port: i64) -> Result<u8, TapoError> {
         })
 }
 
+/// Parse the device's child list. Every field that decides *which* outlet a
+/// command targets or what state is reported must be present and well-formed:
+/// guessing (list order, "off") could switch the wrong outlet or fabricate a
+/// state, so anything else is a protocol error.
 fn parse_children(list: &[Value]) -> Result<Vec<Child>, TapoError> {
-    list.iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let device_id = c
-                .get("device_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| TapoError::Protocol("child entry has no device_id".into()))?
-                .to_string();
-            let position = c
-                .get("position")
-                .and_then(Value::as_i64)
-                .unwrap_or(i as i64 + 1);
-            Ok(Child {
-                position: u8::try_from(position)
-                    .map_err(|_| TapoError::Protocol("child position out of range".into()))?,
-                device_id,
-                on: c.get("device_on").and_then(Value::as_bool).unwrap_or(false),
-            })
-        })
-        .collect()
+    let mut children: Vec<Child> = Vec::with_capacity(list.len());
+    for c in list {
+        let device_id = c
+            .get("device_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| TapoError::Protocol("child entry has no device_id".into()))?
+            .to_string();
+        let position = c
+            .get("position")
+            .and_then(Value::as_i64)
+            .and_then(|p| u8::try_from(p).ok())
+            .filter(|p| (1..=PORT_COUNT).contains(p))
+            .ok_or_else(|| {
+                TapoError::Protocol(format!(
+                    "child entry has no valid `position` (expected an integer 1..={PORT_COUNT})"
+                ))
+            })?;
+        let on = c
+            .get("device_on")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| TapoError::Protocol("child entry has no boolean `device_on`".into()))?;
+        if children
+            .iter()
+            .any(|k| k.position == position || k.device_id == device_id)
+        {
+            return Err(TapoError::Protocol(
+                "child list repeats a position or device_id".into(),
+            ));
+        }
+        children.push(Child {
+            position,
+            device_id,
+            on,
+        });
+    }
+    Ok(children)
 }
 
 impl Strip {
@@ -144,10 +165,17 @@ impl Strip {
             })),
         );
         let reply = self.client.request(&command).await?;
-        // The wrapped child's own result carries its own error_code.
-        let inner_code = reply["result"]["response_data"]["error_code"]
-            .as_i64()
-            .unwrap_or(0);
+        // The wrapped child's own result carries its own error_code. The P316M
+        // spells the key `responseData`; `response_data` is accepted too. It must
+        // be present: a missing code is not an acknowledgement.
+        let wrapped = reply["result"]
+            .get("responseData")
+            .or_else(|| reply["result"].get("response_data"));
+        let inner_code = wrapped
+            .and_then(|w| w["error_code"].as_i64())
+            .ok_or_else(|| {
+                TapoError::Protocol("switch reply carries no child error_code".into())
+            })?;
         if inner_code != 0 {
             return Err(TapoError::Device { code: inner_code });
         }
@@ -265,6 +293,73 @@ mod tests {
         for good in 1..=6 {
             assert_eq!(check_port(good).unwrap(), good as u8);
         }
+    }
+
+    #[test]
+    fn child_list_must_be_complete_and_unambiguous() {
+        let good = json!({"device_id": "A", "position": 2, "device_on": true});
+        assert_eq!(
+            parse_children(std::slice::from_ref(&good)).unwrap(),
+            vec![Child {
+                position: 2,
+                device_id: "A".into(),
+                on: true
+            }]
+        );
+        for (name, bad) in [
+            ("no position", json!({"device_id": "A", "device_on": true})),
+            (
+                "string position",
+                json!({"device_id": "A", "position": "2", "device_on": true}),
+            ),
+            (
+                "position 0",
+                json!({"device_id": "A", "position": 0, "device_on": true}),
+            ),
+            (
+                "position 7",
+                json!({"device_id": "A", "position": 7, "device_on": true}),
+            ),
+            ("no device_on", json!({"device_id": "A", "position": 2})),
+            (
+                "numeric device_on",
+                json!({"device_id": "A", "position": 2, "device_on": 1}),
+            ),
+            ("no device_id", json!({"position": 2, "device_on": true})),
+            (
+                "empty device_id",
+                json!({"device_id": "", "position": 2, "device_on": true}),
+            ),
+        ] {
+            assert!(
+                matches!(parse_children(&[bad]), Err(TapoError::Protocol(_))),
+                "{name}"
+            );
+        }
+        let dup_pos = json!({"device_id": "B", "position": 2, "device_on": false});
+        assert!(parse_children(&[good.clone(), dup_pos]).is_err());
+        let dup_id = json!({"device_id": "A", "position": 3, "device_on": false});
+        assert!(parse_children(&[good, dup_id]).is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_child_error_code_is_not_an_acknowledgement() {
+        let (dev, strip) = strip().await;
+        dev.state.lock().unwrap().omit_child_error_code = true;
+        let err = strip.set(3, true).await.unwrap_err();
+        assert!(matches!(err, TapoError::Protocol(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn child_failure_inside_a_successful_reply_is_an_error() {
+        let (dev, strip) = strip().await;
+        dev.state.lock().unwrap().child_error_code = Some(-1008);
+        let err = strip.set(3, true).await.unwrap_err();
+        assert!(matches!(err, TapoError::Device { code: -1008 }), "{err}");
+        assert!(
+            !dev.state.lock().unwrap().outlets[2],
+            "the outlet was not switched"
+        );
     }
 
     #[tokio::test]
