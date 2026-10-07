@@ -101,6 +101,20 @@ the device or this implementation) or `500` (anything that went wrong talking
 to the device). If a token is configured, every route except `/health`
 requires `Authorization: Bearer <token>` or gets `401 {"error":"unauthorized"}`.
 
+## Development
+
+Enable the repository's pre-commit hook once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+It runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test`
+(when Rust or build files are staged), and refuses credential-like files
+(`.env`, `credentials*`, `captures/`, keys) and staged private keys or access
+tokens. CI runs the same checks; `git commit --no-verify` bypasses the hook
+only locally.
+
 ## Tests
 
 ```sh
