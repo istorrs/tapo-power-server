@@ -18,7 +18,26 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl   # static binary
 ```
 
-Tagged releases (`v*`) publish a static Linux x86-64 binary to GitHub Releases.
+Tagged releases (`v*`) publish to GitHub Releases:
+
+- a Python **wheel** (`pip install` puts `tapo-power-server` and `tapo-probe`
+  in the environment's `bin/`), and
+- a standalone static Linux x86-64 tarball with a `SHA256SUMS` file.
+
+The binary is statically linked against musl, so it runs on both glibc and
+musl systems. The wheel therefore carries both platform tags
+(`manylinux2014_x86_64` and `musllinux_1_2_x86_64`); a musllinux-only tag would
+be rejected by `pip` on glibc hosts such as Ubuntu. The wheel is built with
+`maturin` (`bindings = "bin"`, see `pyproject.toml`):
+
+```sh
+pip install maturin
+maturin build --release --target x86_64-unknown-linux-musl \
+    --compatibility manylinux2014 musllinux_1_2 --out dist
+pip install dist/*.whl      # e.g. from a git tag: pip install <wheel URL>
+```
+
+The release tag must equal the crate version (`v0.1.0` for `version = "0.1.0"`).
 
 ## Run
 

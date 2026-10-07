@@ -15,17 +15,35 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tag must match the crate version
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != crate version v${version}"; exit 1; }
       - run: cargo test --locked
-      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
-      - name: Package
+      - name: Build wheel
+        # The binary is statically linked against musl, so it runs on both glibc
+        # and musl systems; tag the wheel for both so pip accepts it on either.
+        run: |
+          pip install maturin
+          maturin build --release --locked --target x86_64-unknown-linux-musl \
+            --compatibility manylinux2014 musllinux_1_2 --out dist
+      - name: Smoke-test the wheel
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install --no-index dist/*.whl
+          /tmp/venv/bin/tapo-power-server --version
+      - name: Package standalone binary
         run: |
           name="tapo-power-server-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl"
           mkdir "$name"
           cp target/x86_64-unknown-linux-musl/release/tapo-power-server "$name/"
           cp README.md LICENSE-MIT LICENSE-APACHE "$name/"
-          tar czf "$name.tar.gz" "$name"
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          tar czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" ./*.whl > SHA256SUMS)
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes tapo-power-server-*.tar.gz*
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes dist/*

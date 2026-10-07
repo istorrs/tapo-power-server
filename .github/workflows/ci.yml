@@ -21,3 +21,23 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       # Hardware tests are skipped unless TAPO_HW_TEST=1, which CI never sets.
       - run: cargo test --locked
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and install the wheel
+        run: |
+          pip install maturin
+          maturin build --release --locked --target x86_64-unknown-linux-musl \
+            --compatibility manylinux2014 musllinux_1_2 --out dist
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install --no-index dist/*.whl
+          /tmp/venv/bin/tapo-power-server --version

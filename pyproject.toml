@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tapo-power-server"
+description = "TPAP client and HTTP power-control server for Tapo power strips"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+dynamic = ["version"]
+
+[tool.maturin]
+# Ship the Rust binary (installed into the environment's bin/ directory)
+# inside a platform wheel; there is no Python module.
+bindings = "bin"
+strip = true
