@@ -1,14 +1,191 @@
 # tapo-power-server
 
-A standalone Rust server that speaks TP-Link's TPAP protocol to Tapo
-power-strip hardware and exposes it over a small HTTP API, for use as an
-optional bench-hardware power controller by
+A standalone Rust server that speaks TP-Link's **TPAP** protocol to Tapo
+power-strip hardware (developed against the **P316M**) and exposes it over a
+small HTTP API, for use as an optional bench-hardware power controller by
 [pyhil](https://github.com/ConnectedDevelopment/xtg-generic-linux-test-framework).
 
-**Start here: [`DESIGN.md`](./DESIGN.md).** It covers why this project
-exists, the protocol background, the exact HTTP contract to implement, crate
-recommendations, configuration, and what's explicitly out of scope for a
-first version. Read it in full before writing code — there is no separate
-spec; it's self-contained.
+Why it exists, protocol notes and decisions: [`DESIGN.md`](./DESIGN.md).
+Build plan and status: [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md).
 
-Status: design-stage, no implementation yet.
+Status: working against real P316M hardware (firmware 1.4.1).
+
+## Build
+
+```sh
+cargo build --release                      # dynamic binary
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl   # static binary
+```
+
+Tagged releases (`v*`) publish to GitHub Releases:
+
+- a Python **wheel** (`pip install` puts `tapo-power-server` and `tapo-probe`
+  in the environment's `bin/`), and
+- a standalone static Linux x86-64 tarball with a `SHA256SUMS` file.
+
+The binary is statically linked against musl, so it runs on both glibc and
+musl systems. The wheel therefore carries both platform tags
+(`manylinux2014_x86_64` and `musllinux_1_2_x86_64`); a musllinux-only tag would
+be rejected by `pip` on glibc hosts such as Ubuntu. The wheel is built with
+`maturin` (`bindings = "bin"`, see `pyproject.toml`):
+
+```sh
+pip install maturin
+maturin build --release --target x86_64-unknown-linux-musl \
+    --compatibility manylinux2014 musllinux_1_2 --out dist
+pip install dist/*.whl      # e.g. from a git tag: pip install <wheel URL>
+```
+
+The release tag must equal the crate version (`v0.1.0` for `version = "0.1.0"`).
+
+## Run
+
+```sh
+tapo-power-server --port 5019 --device-host 192.168.1.213 \
+    --credentials-file ~/.config/tapo-power-server/credentials \
+    --token-env TAPO_SERVER_TOKEN
+```
+
+| Flag | Meaning |
+|---|---|
+| `--host` | Address to listen on (default `0.0.0.0`). |
+| `--port` | Port to listen on (required; pick one not used by other power servers). |
+| `--token-env VAR` | Env var holding a bearer token to require. Unset = open API. |
+| `--device-host IP` | Address of the Tapo device (required). |
+| `--device-port` | Device HTTP port (default 80). |
+| `--credentials-file PATH` | File with `TAPO_EMAIL=` / `TAPO_PASSWORD=` lines. Must be mode `0600`. |
+| `--email-env` / `--password-env` | Alternative to the file: env vars holding the account email / password (defaults `TAPO_EMAIL`, `TAPO_PASSWORD`). |
+
+### Credentials
+
+The P316M requires the TP-Link **account** email and password used to set the
+plug up in the Tapo app. They authenticate the *local* session only; the
+server never talks to the cloud. Consider a dedicated bench account that the
+strip is shared to.
+
+The password is never accepted as a command-line argument, never logged and
+never included in error messages. Keep the credentials file outside any
+repository (for example `~/.config/tapo-power-server/credentials`, mode
+`0600`); the server refuses a group- or world-readable file, and refuses the
+placeholder values.
+
+**Credentials file format.** `KEY=VALUE` lines (`TAPO_EMAIL`, `TAPO_PASSWORD`);
+blank lines and `#` comments are skipped, a leading `export ` is accepted, and
+unknown keys are ignored. One pair of matching surrounding quotes is stripped
+from a value, so a password that itself starts and ends with a quote must be
+wrapped in another pair. A line that is not `KEY=VALUE` is an error (reported
+by line number, never by content) rather than being silently skipped.
+
+**Login lockout safety.** The device counts failed logins and locks out, so
+the server is deliberately conservative:
+
+- Each handshake makes exactly one login attempt.
+- If the device **rejects** a login, the server stops contacting the device
+  entirely and answers device routes with errors until you fix the
+  credentials and restart it. It does not exit, so a supervisor such as
+  systemd will not keep retrying the login.
+- Any other failure after the login starts (an HTTP error, a malformed
+  reply, a dropped connection) or an interrupted attempt starts a 30-second
+  cooldown during which no new login is tried; after that, it retries.
+  Failures before the login starts (device offline) do not trigger it.
+- If a login proof is sent and no answer ever comes back (timeout, dropped
+  connection, interrupted request), the device may have counted it as a
+  failure. After three such attempts in a row the server disables login until
+  it is restarted. Any answer from the device, even an HTTP error, resets the
+  count.
+- State-changing requests run to completion even if the HTTP client
+  disconnects, so a `/sequence` is never abandoned half-way. On SIGTERM or
+  Ctrl-C the server stops accepting requests but waits for such in-flight
+  operations to finish before exiting.
+- At most 32 device operations may be queued or running at once; further
+  requests are refused immediately with `error_type` `Busy` (status 500)
+  instead of piling up behind a long sequence.
+- Request bodies must arrive within 10 seconds and be under 64 KiB, and input
+  is validated before a request is admitted, so malformed requests are always
+  a `400` even when the server is busy.
+- Device responses larger than 1 MiB are rejected while they stream in, and
+  IPv6 device addresses (`--device-host ::1`) are bracketed in URLs.
+- Redirects from the device are never followed (a redirect would resend a
+  login proof), and session identifiers are scrubbed from error messages.
+- Replies must answer the request they are sent for: a response sealed under a
+  different sequence number (a replay) is rejected, and a plaintext reply is
+  only accepted as an error.
+
+## HTTP API
+
+Ports are **1-based**: 1-6 match the physical outlet labels. Anything else,
+including 0, is a `400`.
+
+| Method | Path | Body / query | Success |
+|---|---|---|---|
+| GET | `/health` | | `{"status":"ok"}` (never touches the device, never needs the token) |
+| POST | `/turn_on` | `{"port": N}` | `{"result": true}` |
+| POST | `/turn_off` | `{"port": N}` | `{"result": false}` |
+| POST | `/toggle` | `{"port": N}` | `{"result": <new state>}` |
+| GET | `/get_state?port=N` | | `{"result": true\|false}` |
+| POST | `/sequence` | `{"port": N, "steps": [{"state":"on"\|"off","hold_ms":ms?}, ...]}` | `{"result":{"ok":true,"steps":n,"last_result":<state>}}` |
+
+`result` is the outlet's resulting on/off state (`true` = on). `/sequence`
+runs all steps as one gesture: no other request can interleave, and a step's
+`hold_ms` is waited out before the next step (not after the last).
+
+Errors are `{"error": "...", "error_type": "..."}` with status `400`
+(caller mistake: bad or missing port, malformed body), `501` (unsupported by
+the device or this implementation) or `500` (anything that went wrong talking
+to the device). If a token is configured, every route except `/health`
+requires `Authorization: Bearer <token>` or gets `401 {"error":"unauthorized"}`.
+
+## Development
+
+Enable the repository's pre-commit hook once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+It runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test`
+(when Rust or build files are staged), and refuses credential-like files
+(`.env`, `credentials*`, `captures/`, keys) and staged private keys or access
+tokens. CI runs the same checks; `git commit --no-verify` bypasses the hook
+only locally.
+
+## Tests
+
+```sh
+cargo test                       # unit + simulated-device tests; no hardware needed
+```
+
+The unit tests include known-answer vectors generated with independent
+implementations (`tools/gen_spake_vector.py`, Python `cryptography`) and an
+in-process simulated device that enforces the CCM sequence number.
+
+### Hardware tests
+
+Skipped unless `TAPO_HW_TEST=1`:
+
+```sh
+TAPO_HW_TEST=1 TAPO_HOST=192.168.1.213 cargo test --test hardware -- --nocapture
+```
+
+Credentials come from `TAPO_CREDENTIALS_FILE` (default
+`~/.config/tapo-power-server/credentials`); `TAPO_HW_PORT` picks the outlet
+(default 5). **The suite can only switch ports 2-5**, because real equipment
+is typically plugged into the end outlets; it always restores the outlet's
+original state. A read-only probe is also available:
+
+```sh
+cargo run --bin tapo-probe -- 192.168.1.213
+```
+
+## Device quirks worth knowing
+
+- The device's HTTP parser only recognises `Content-Length` in **title case**;
+  with a lowercase header it ignores the body and returns a generic HTML page.
+  The client therefore sends title-case headers (covered by a wire-level test).
+- On the P316M `login/discover` reports passcode type `[2]`, so the MAC-derived
+  default passcode is not available and account credentials are required.
+
+## License
+
+Dual-licensed under MIT or Apache-2.0, at your option.
