@@ -94,6 +94,36 @@ fn parse_children(list: &[Value]) -> Result<Vec<Child>, TapoError> {
     Ok(children)
 }
 
+/// Validate a step list without touching the device. The HTTP layer calls this
+/// before admitting a request, so malformed input is answered as a caller
+/// mistake even when the server is busy.
+pub fn validate_sequence(steps: &[Step]) -> Result<(), TapoError> {
+    if steps.is_empty() || steps.len() > MAX_STEPS {
+        return Err(TapoError::InvalidArgument(format!(
+            "steps must contain 1..={MAX_STEPS} entries"
+        )));
+    }
+    if steps
+        .iter()
+        .any(|s| s.hold_ms.is_some_and(|h| h > MAX_HOLD_MS))
+    {
+        return Err(TapoError::InvalidArgument(format!(
+            "hold_ms must be at most {MAX_HOLD_MS}"
+        )));
+    }
+    // The last step's hold is never waited out, so it does not count.
+    let total: u64 = steps[..steps.len() - 1]
+        .iter()
+        .filter_map(|s| s.hold_ms)
+        .sum();
+    if total > MAX_TOTAL_HOLD_MS {
+        return Err(TapoError::InvalidArgument(format!(
+            "total hold time must be at most {MAX_TOTAL_HOLD_MS} ms"
+        )));
+    }
+    Ok(())
+}
+
 impl Strip {
     pub fn new(client: TpapClient) -> Self {
         Self {
@@ -255,29 +285,7 @@ impl Strip {
         steps: &[Step],
     ) -> Result<(usize, Option<bool>), TapoError> {
         let port = check_port(port)?;
-        if steps.is_empty() || steps.len() > MAX_STEPS {
-            return Err(TapoError::InvalidArgument(format!(
-                "steps must contain 1..={MAX_STEPS} entries"
-            )));
-        }
-        if steps
-            .iter()
-            .any(|s| s.hold_ms.is_some_and(|h| h > MAX_HOLD_MS))
-        {
-            return Err(TapoError::InvalidArgument(format!(
-                "hold_ms must be at most {MAX_HOLD_MS}"
-            )));
-        }
-        // The last step's hold is never waited out, so it does not count.
-        let total: u64 = steps[..steps.len() - 1]
-            .iter()
-            .filter_map(|s| s.hold_ms)
-            .sum();
-        if total > MAX_TOTAL_HOLD_MS {
-            return Err(TapoError::InvalidArgument(format!(
-                "total hold time must be at most {MAX_TOTAL_HOLD_MS} ms"
-            )));
-        }
+        validate_sequence(steps)?;
         let mut cache = self.op.lock().await;
         let mut last = None;
         for (i, step) in steps.iter().enumerate() {

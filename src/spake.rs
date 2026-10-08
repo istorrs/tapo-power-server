@@ -104,10 +104,16 @@ pub fn random_scalar() -> Result<Scalar, SpakeError> {
     }
 }
 
+/// Decode a SEC1 point; the point at infinity is rejected, since no protocol
+/// value (M, N, or a peer's share) may be the identity.
 pub fn decode_point(bytes: &[u8]) -> Result<ProjectivePoint, SpakeError> {
-    AffinePoint::from_sec1_bytes(bytes)
+    let point = AffinePoint::from_sec1_bytes(bytes)
         .map(ProjectivePoint::from)
-        .map_err(|_| SpakeError::InvalidPoint)
+        .map_err(|_| SpakeError::InvalidPoint)?;
+    if point == ProjectivePoint::IDENTITY {
+        return Err(SpakeError::InvalidPoint);
+    }
+    Ok(point)
 }
 
 pub fn encode_point(point: &ProjectivePoint) -> Vec<u8> {
@@ -226,6 +232,13 @@ pub fn finish(
     let r_prime = r - n * w.w0;
     let z = r_prime * x;
     let v = r_prime * w.w1;
+    // RFC 9383: abort if the shared points are the identity. A share crafted as
+    // w0*N makes R' the identity, so Z and V would no longer depend on any
+    // secret of ours.
+    let identity = ProjectivePoint::IDENTITY;
+    if r_prime == identity || z == identity || v == identity {
+        return Err(SpakeError::InvalidPoint);
+    }
 
     let th = transcript_hash(
         user_random,
@@ -392,6 +405,22 @@ mod tests {
             hex::encode(&*hs.shared_key),
             "2a1c88dc9cde5b4952fd5f40cd4d24f597066878fc25cc1e04532a8581b8892b"
         );
+    }
+
+    #[test]
+    fn identity_shared_points_are_rejected() {
+        let w = derive_w(b"pw", b"salt-salt-salt", 10).unwrap();
+        let x = random_scalar().unwrap();
+        let n = decode_point(&N_COMPRESSED).unwrap();
+        // R = w0*N, so R' = R - w0*N is the identity point.
+        let crafted = encode_point(&(n * w.w0));
+        assert!(matches!(
+            finish(&x, &w, &[1; 32], &[2; 32], &crafted),
+            Err(SpakeError::InvalidPoint)
+        ));
+        // The point at infinity itself is not an acceptable share either.
+        assert!(finish(&x, &w, &[1; 32], &[2; 32], &[0u8]).is_err());
+        assert!(finish(&x, &w, &[1; 32], &[2; 32], &[]).is_err());
     }
 
     #[test]

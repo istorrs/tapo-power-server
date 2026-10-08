@@ -10,7 +10,7 @@
 //! 1-based. If a bearer token is configured every route except `/health`
 //! needs `Authorization: Bearer <token>` (constant-time comparison).
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -28,10 +28,14 @@ use tokio_util::task::TaskTracker;
 
 use crate::{
     error::TapoError,
-    strip::{Step, Strip},
+    strip::{Step, Strip, check_port, validate_sequence},
 };
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// How long a client may take to deliver a request body. Without a deadline a
+/// client that sends headers and then stalls would hold its connection (and a
+/// graceful shutdown) indefinitely.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Device operations that may be queued or running at once. They are
 /// serialised on the device, and a long `/sequence` can hold the queue for up
 /// to an hour, so the backlog (and the shutdown wait) must be bounded.
@@ -45,6 +49,7 @@ pub struct AppState {
     pub tracker: TaskTracker,
     /// Admission limit for device operations; excess requests are refused at once.
     admission: Arc<Semaphore>,
+    body_timeout: Duration,
 }
 
 impl AppState {
@@ -58,7 +63,14 @@ impl AppState {
             token,
             tracker: TaskTracker::new(),
             admission: Arc::new(Semaphore::new(limit)),
+            body_timeout: BODY_READ_TIMEOUT,
         }
+    }
+
+    /// Override how long a request body may take to arrive.
+    pub fn with_body_timeout(mut self, timeout: Duration) -> Self {
+        self.body_timeout = timeout;
+        self
     }
 }
 
@@ -130,18 +142,18 @@ where
 /// framework-generated plain-text response.
 struct Capped(Bytes);
 
-impl<S: Send + Sync> axum::extract::FromRequest<S> for Capped {
+impl axum::extract::FromRequest<AppState> for Capped {
     type Rejection = TapoError;
 
-    async fn from_request(req: Request, _state: &S) -> Result<Self, TapoError> {
-        axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
-            .await
-            .map(Capped)
-            .map_err(|_| {
-                bad(format!(
-                    "request body is too large or unreadable (limit {MAX_BODY_BYTES} bytes)"
-                ))
-            })
+    async fn from_request(req: Request, state: &AppState) -> Result<Self, TapoError> {
+        let read = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES);
+        match tokio::time::timeout(state.body_timeout, read).await {
+            Ok(Ok(body)) => Ok(Capped(body)),
+            Ok(Err(_)) => Err(bad(format!(
+                "request body is too large or unreadable (limit {MAX_BODY_BYTES} bytes)"
+            ))),
+            Err(_) => Err(bad("timed out waiting for the request body")),
+        }
     }
 }
 
@@ -192,6 +204,7 @@ fn parse_json(body: &Bytes) -> Result<Value, TapoError> {
 
 async fn switch(state: AppState, body: Bytes, on: bool) -> Reply {
     let port = int_field(&parse_json(&body)?, "port")?;
+    check_port(port)?; // before admission: bad input is a 400 even when busy
     let strip = state.strip.clone();
     let new_state = detached(&state, async move { strip.set(port, on).await }).await?;
     Ok(ok(json!(new_state)))
@@ -207,6 +220,7 @@ async fn turn_off(State(state): State<AppState>, Capped(body): Capped) -> Reply 
 
 async fn toggle(State(state): State<AppState>, Capped(body): Capped) -> Reply {
     let port = int_field(&parse_json(&body)?, "port")?;
+    check_port(port)?;
     let strip = state.strip.clone();
     let new_state = detached(&state, async move { strip.toggle(port).await }).await?;
     Ok(ok(json!(new_state)))
@@ -224,6 +238,7 @@ async fn get_state(
         .ok_or_else(|| bad("missing `port` query parameter"))?
         .parse::<i64>()
         .map_err(|_| bad("`port` must be an integer"))?;
+    check_port(port)?;
     let strip = state.strip.clone();
     let current = detached(&state, async move { strip.state(port).await }).await?;
     Ok(ok(json!(current)))
@@ -261,6 +276,8 @@ async fn sequence(State(state): State<AppState>, Capped(body): Capped) -> Reply 
     let v = parse_json(&body)?;
     let port = int_field(&v, "port")?;
     let steps = parse_steps(&v)?;
+    check_port(port)?;
+    validate_sequence(&steps)?;
     let strip = state.strip.clone();
     let (count, last) = detached(&state, async move { strip.sequence(port, &steps).await }).await?;
     Ok(ok(json!({"ok": true, "steps": count, "last_result": last})))
@@ -269,6 +286,8 @@ async fn sequence(State(state): State<AppState>, Capped(body): Capped) -> Reply 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use crate::{
         client::{ClientConfig, TpapClient},
         credentials::Credentials,
@@ -283,14 +302,23 @@ mod tests {
     }
 
     async fn start(token: Option<&str>, password: &str) -> Harness {
-        start_inner(token, password, None).await
+        start_inner(token, password, None, None).await
+    }
+
+    async fn start_with_body_timeout(timeout: Duration) -> Harness {
+        start_inner(None, "correct horse", None, Some(timeout)).await
     }
 
     async fn start_with_limit(limit: usize) -> Harness {
-        start_inner(None, "correct horse", Some(limit)).await
+        start_inner(None, "correct horse", Some(limit), None).await
     }
 
-    async fn start_inner(token: Option<&str>, password: &str, limit: Option<usize>) -> Harness {
+    async fn start_inner(
+        token: Option<&str>,
+        password: &str,
+        limit: Option<usize>,
+        body_timeout: Option<Duration>,
+    ) -> Harness {
         let dev = MockDevice::start(MockConfig::default()).await;
         let mut config = ClientConfig::new("127.0.0.1");
         config.port = dev.addr.port();
@@ -300,6 +328,10 @@ mod tests {
         let state = match limit {
             Some(n) => AppState::with_limit(strip, token, n),
             None => AppState::new(strip, token),
+        };
+        let state = match body_timeout {
+            Some(t) => state.with_body_timeout(t),
+            None => state,
         };
         let tracker = state.tracker.clone();
         let app = router(state);
@@ -518,6 +550,76 @@ mod tests {
         assert_eq!((first.await.unwrap(), second.await.unwrap()), (200, 200));
         // Once they finish, capacity is available again.
         assert_eq!(h.post("/toggle", r#"{"port": 4}"#).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn invalid_input_is_a_400_even_when_the_server_is_busy() {
+        let h = start_with_limit(1).await;
+        let slow = r#"{"port": 2, "steps": [{"state":"on","hold_ms":500},{"state":"off"}]}"#;
+        let running = tokio::spawn({
+            let (http, url) = (h.http.clone(), format!("{}/sequence", h.base));
+            async move {
+                http.post(url)
+                    .body(slow)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // The only permit is taken. Malformed requests are still caller
+        // mistakes; only a valid request is refused as busy.
+        for (path, body) in [
+            ("/turn_on", r#"{"port": 0}"#),
+            ("/turn_off", r#"{"port": 7}"#),
+            ("/toggle", r#"{"port": -1}"#),
+            ("/sequence", r#"{"port": 2, "steps": []}"#),
+            ("/sequence", r#"{"port": 9, "steps": [{"state":"on"}]}"#),
+            (
+                "/sequence",
+                r#"{"port": 2, "steps": [{"state":"on","hold_ms":4000000},{"state":"off"}]}"#,
+            ),
+        ] {
+            let (status, json) = h.post(path, body).await;
+            assert_eq!(
+                (status, json["error_type"].as_str()),
+                (400, Some("InvalidArgument")),
+                "{path} {body}"
+            );
+        }
+        assert_eq!(h.get("/get_state?port=0").await.0, 400);
+        let (status, json) = h.post("/toggle", r#"{"port": 3}"#).await;
+        assert_eq!((status, json["error_type"].as_str()), (500, Some("Busy")));
+        assert_eq!(running.await.unwrap(), 200);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_request_body_times_out_with_a_json_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let h = start_with_body_timeout(Duration::from_millis(250)).await;
+        let addr = h.base.trim_start_matches("http://").to_string();
+        let mut sock = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        // Promise 100 bytes of body, send 1, then go quiet.
+        sock.write_all(b"POST /turn_on HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut reply = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut reply)).await;
+        assert!(
+            read.is_ok(),
+            "the server must answer instead of waiting forever"
+        );
+        let text = String::from_utf8_lossy(&reply).to_string();
+        assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+        assert!(
+            text.contains("InvalidArgument") && text.contains("timed out"),
+            "{text}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[tokio::test]

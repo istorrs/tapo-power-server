@@ -101,6 +101,9 @@ the server is deliberately conservative:
 - At most 32 device operations may be queued or running at once; further
   requests are refused immediately with `error_type` `Busy` (status 500)
   instead of piling up behind a long sequence.
+- Request bodies must arrive within 10 seconds and be under 64 KiB, and input
+  is validated before a request is admitted, so malformed requests are always
+  a `400` even when the server is busy.
 - Device responses larger than 1 MiB are rejected while they stream in, and
   IPv6 device addresses (`--device-host ::1`) are bracketed in URLs.
 - Redirects from the device are never followed (a redirect would resend a
