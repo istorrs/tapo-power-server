@@ -98,6 +98,11 @@ the server is deliberately conservative:
   disconnects, so a `/sequence` is never abandoned half-way. On SIGTERM or
   Ctrl-C the server stops accepting requests but waits for such in-flight
   operations to finish before exiting.
+- At most 32 device operations may be queued or running at once; further
+  requests are refused immediately with `error_type` `Busy` (status 500)
+  instead of piling up behind a long sequence.
+- Redirects from the device are never followed (a redirect would resend a
+  login proof), and session identifiers are scrubbed from error messages.
 - Replies must answer the request they are sent for: a response sealed under a
   different sequence number (a replay) is rejected, and a plaintext reply is
   only accepted as an error.

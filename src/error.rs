@@ -25,6 +25,9 @@ pub enum TapoError {
     /// and a fresh one must be established.
     #[error("session expired: {0}")]
     SessionExpired(String),
+    /// Too many device operations are already queued or running.
+    #[error("busy: {0}")]
+    Busy(String),
     /// Malformed or unexpected protocol data.
     #[error("protocol error: {0}")]
     Protocol(String),
@@ -42,6 +45,7 @@ impl TapoError {
             Self::Authentication(_) => "AuthenticationError",
             Self::Device { .. } => "DeviceError",
             Self::SessionExpired(_) => "SessionExpired",
+            Self::Busy(_) => "Busy",
             Self::Protocol(_) => "ProtocolError",
             Self::Transport(_) => "TransportError",
         }

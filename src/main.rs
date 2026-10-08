@@ -103,15 +103,19 @@ async fn main() {
         if token.is_some() { "required" } else { "off" }
     );
 
+    let state = AppState::new(strip.clone(), token);
+    let tracker = state.tracker.clone();
+
     // Try one login up front, in the background so the server (and /health)
-    // is available immediately even if the device is slow or offline. A
-    // rejected login does NOT exit: a supervisor restarting the process would
-    // retry the login and could lock the device out. The server stays up and
-    // answers device routes with errors until it is restarted by hand.
-    let initial = strip.clone();
+    // is available immediately even if the device is slow or offline. It is
+    // tracked like any device operation, so shutdown waits for it rather than
+    // cancelling a login whose outcome would then be unknown. A rejected login
+    // does NOT exit: a supervisor restarting the process would retry the login
+    // and could lock the device out. The server stays up and answers device
+    // routes with errors until it is restarted by hand.
     let (device_host, device_port) = (args.device_host.clone(), args.device_port);
-    tokio::spawn(async move {
-        match initial.client().connect().await {
+    tracker.spawn(async move {
+        match strip.client().connect().await {
             Ok(()) => eprintln!("connected to {device_host}:{device_port}"),
             Err(e @ TapoError::Authentication(_)) => eprintln!(
                 "ERROR: {e}\nERROR: device routes will fail until the credentials are fixed and the server is restarted"
@@ -120,8 +124,6 @@ async fn main() {
         }
     });
 
-    let state = AppState::new(strip, token);
-    let tracker = state.tracker.clone();
     let app = router(state);
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

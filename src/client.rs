@@ -127,8 +127,29 @@ fn describe(e: &reqwest::Error) -> String {
         msg.push_str(&s.to_string());
         src = s.source();
     }
-    // The URL contains only the device address, no secrets, but keep it short.
-    msg.to_ascii_lowercase()
+    // The request URL of a session request embeds the session id
+    // (`/stok=<id>/ds`), and this text ends up in HTTP error bodies and logs.
+    if let Some(url) = e.url() {
+        msg = msg.replace(url.as_str(), "<device>");
+    }
+    scrub_session_ids(&msg).to_ascii_lowercase()
+}
+
+/// Replace anything that looks like `stok=<value>` with `stok=<redacted>`.
+fn scrub_session_ids(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("stok=") {
+        out.push_str(&rest[..i]);
+        out.push_str("stok=<redacted>");
+        let after = &rest[i + "stok=".len()..];
+        let end = after
+            .find(['/', ')', '"', '\'', ' ', '?', '#'])
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// RFC 3986 unreserved characters pass through; everything else is %-encoded
@@ -206,6 +227,9 @@ impl TpapClient {
         let http = reqwest::Client::builder()
             .http1_title_case_headers()
             .no_proxy()
+            // A redirect would resend a POST body (a login proof) and could send
+            // device traffic elsewhere; treat 3xx as an error instead.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(config.connect_timeout)
             .timeout(config.request_timeout)
             .build()
@@ -999,5 +1023,68 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, TapoError::Protocol(_)), "{err}");
+    }
+
+    #[test]
+    fn session_ids_are_scrubbed_from_text() {
+        assert_eq!(
+            scrub_session_ids(
+                "error sending request for url (http://10.0.0.5/stok=AbC%2F123/ds): x"
+            ),
+            "error sending request for url (http://10.0.0.5/stok=<redacted>/ds): x"
+        );
+        assert_eq!(scrub_session_ids("a stok=XYZ"), "a stok=<redacted>");
+        assert_eq!(
+            scrub_session_ids("stok=A/ds stok=B/ds"),
+            "stok=<redacted>/ds stok=<redacted>/ds"
+        );
+        assert_eq!(scrub_session_ids("nothing here"), "nothing here");
+    }
+
+    #[tokio::test]
+    async fn transport_errors_do_not_leak_the_session_id() {
+        // A real reqwest connection error for a session-style URL.
+        let http = reqwest::Client::new();
+        let err = http
+            .post("http://127.0.0.1:1/stok=SECRETSESSIONID/ds")
+            .send()
+            .await
+            .unwrap_err();
+        let text = describe(&err);
+        assert!(!text.to_lowercase().contains("secretsessionid"), "{text}");
+        assert!(!text.contains("/ds"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // B must never be contacted.
+        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_port = b.local_addr().unwrap().port();
+        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_port = a.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = a.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let reply = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{b_port}/\r\nContent-Length: 0\r\n\r\n"
+            );
+            let _ = sock.write_all(reply.as_bytes()).await;
+        });
+        let mut config = ClientConfig::new("127.0.0.1");
+        config.port = a_port;
+        let client = TpapClient::new(
+            config,
+            Credentials::new("a@b.c".into(), "pw".into()).unwrap(),
+        )
+        .unwrap();
+        let err = client.connect().await.unwrap_err();
+        assert!(err.to_string().contains("307"), "{err}");
+        let second = tokio::time::timeout(Duration::from_millis(300), b.accept()).await;
+        assert!(
+            second.is_err(),
+            "the redirect target must not receive a connection"
+        );
     }
 }

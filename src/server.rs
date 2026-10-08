@@ -23,6 +23,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
 
 use crate::{
@@ -31,6 +32,10 @@ use crate::{
 };
 
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Device operations that may be queued or running at once. They are
+/// serialised on the device, and a long `/sequence` can hold the queue for up
+/// to an hour, so the backlog (and the shutdown wait) must be bounded.
+const MAX_IN_FLIGHT: usize = 32;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,14 +43,21 @@ pub struct AppState {
     pub token: Option<Arc<String>>,
     /// Tracks device operations so shutdown can wait for them to finish.
     pub tracker: TaskTracker,
+    /// Admission limit for device operations; excess requests are refused at once.
+    admission: Arc<Semaphore>,
 }
 
 impl AppState {
     pub fn new(strip: Arc<Strip>, token: Option<Arc<String>>) -> Self {
+        Self::with_limit(strip, token, MAX_IN_FLIGHT)
+    }
+
+    pub fn with_limit(strip: Arc<Strip>, token: Option<Arc<String>>, limit: usize) -> Self {
         Self {
             strip,
             token,
             tracker: TaskTracker::new(),
+            admission: Arc::new(Semaphore::new(limit)),
         }
     }
 }
@@ -93,13 +105,22 @@ fn bad(msg: impl Into<String>) -> TapoError {
 /// held in reset, say), and an interrupted login could confuse the lockout
 /// guard, so device work runs in its own task. The task is registered with
 /// `tracker` so that shutdown can wait for it.
-async fn detached<T, F>(tracker: &TaskTracker, fut: F) -> Result<T, TapoError>
+async fn detached<T, F>(state: &AppState, fut: F) -> Result<T, TapoError>
 where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, TapoError>> + Send + 'static,
 {
-    tracker
-        .spawn(fut)
+    // The permit is held until the operation finishes, not merely until the
+    // client leaves, so abandoned operations still count against the limit.
+    let permit = state.admission.clone().try_acquire_owned().map_err(|_| {
+        TapoError::Busy("too many device operations are already in progress".into())
+    })?;
+    state
+        .tracker
+        .spawn(async move {
+            let _permit = permit;
+            fut.await
+        })
         .await
         .map_err(|e| TapoError::Protocol(format!("operation task failed: {e}")))?
 }
@@ -172,7 +193,7 @@ fn parse_json(body: &Bytes) -> Result<Value, TapoError> {
 async fn switch(state: AppState, body: Bytes, on: bool) -> Reply {
     let port = int_field(&parse_json(&body)?, "port")?;
     let strip = state.strip.clone();
-    let new_state = detached(&state.tracker, async move { strip.set(port, on).await }).await?;
+    let new_state = detached(&state, async move { strip.set(port, on).await }).await?;
     Ok(ok(json!(new_state)))
 }
 
@@ -187,7 +208,7 @@ async fn turn_off(State(state): State<AppState>, Capped(body): Capped) -> Reply 
 async fn toggle(State(state): State<AppState>, Capped(body): Capped) -> Reply {
     let port = int_field(&parse_json(&body)?, "port")?;
     let strip = state.strip.clone();
-    let new_state = detached(&state.tracker, async move { strip.toggle(port).await }).await?;
+    let new_state = detached(&state, async move { strip.toggle(port).await }).await?;
     Ok(ok(json!(new_state)))
 }
 
@@ -204,7 +225,7 @@ async fn get_state(
         .parse::<i64>()
         .map_err(|_| bad("`port` must be an integer"))?;
     let strip = state.strip.clone();
-    let current = detached(&state.tracker, async move { strip.state(port).await }).await?;
+    let current = detached(&state, async move { strip.state(port).await }).await?;
     Ok(ok(json!(current)))
 }
 
@@ -241,11 +262,7 @@ async fn sequence(State(state): State<AppState>, Capped(body): Capped) -> Reply 
     let port = int_field(&v, "port")?;
     let steps = parse_steps(&v)?;
     let strip = state.strip.clone();
-    let (count, last) = detached(
-        &state.tracker,
-        async move { strip.sequence(port, &steps).await },
-    )
-    .await?;
+    let (count, last) = detached(&state, async move { strip.sequence(port, &steps).await }).await?;
     Ok(ok(json!({"ok": true, "steps": count, "last_result": last})))
 }
 
@@ -266,12 +283,24 @@ mod tests {
     }
 
     async fn start(token: Option<&str>, password: &str) -> Harness {
+        start_inner(token, password, None).await
+    }
+
+    async fn start_with_limit(limit: usize) -> Harness {
+        start_inner(None, "correct horse", Some(limit)).await
+    }
+
+    async fn start_inner(token: Option<&str>, password: &str, limit: Option<usize>) -> Harness {
         let dev = MockDevice::start(MockConfig::default()).await;
         let mut config = ClientConfig::new("127.0.0.1");
         config.port = dev.addr.port();
         let creds = Credentials::new("user@example.com".into(), password.into()).unwrap();
         let strip = Arc::new(Strip::new(TpapClient::new(config, creds).unwrap()));
-        let state = AppState::new(strip, token.map(|t| Arc::new(t.to_string())));
+        let token = token.map(|t| Arc::new(t.to_string()));
+        let state = match limit {
+            Some(n) => AppState::with_limit(strip, token, n),
+            None => AppState::new(strip, token),
+        };
         let tracker = state.tracker.clone();
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -442,6 +471,53 @@ mod tests {
         let st = h.dev.state.lock().unwrap();
         let sets: Vec<&String> = st.log.iter().filter(|l| l.starts_with("set")).collect();
         assert_eq!(sets, ["set 4 true", "set 4 false", "set 4 true"]);
+    }
+
+    #[tokio::test]
+    async fn excess_device_operations_are_refused_immediately() {
+        let h = start_with_limit(2).await;
+        let slow = r#"{"port": 2, "steps": [{"state":"on","hold_ms":600},{"state":"off"}]}"#;
+        let first = tokio::spawn({
+            let (http, url) = (h.http.clone(), format!("{}/sequence", h.base));
+            async move {
+                http.post(url)
+                    .body(slow)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let second = tokio::spawn({
+            let (http, url) = (h.http.clone(), format!("{}/toggle", h.base));
+            async move {
+                http.post(url)
+                    .body(r#"{"port": 3}"#)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Two operations are admitted (one running, one queued); the third is
+        // refused straight away instead of piling up behind the sequence.
+        let started = std::time::Instant::now();
+        let (status, body) = h.post("/toggle", r#"{"port": 4}"#).await;
+        assert_eq!(
+            (status, body["error_type"].as_str()),
+            (500, Some("Busy")),
+            "{body}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(300));
+
+        assert_eq!((first.await.unwrap(), second.await.unwrap()), (200, 200));
+        // Once they finish, capacity is available again.
+        assert_eq!(h.post("/toggle", r#"{"port": 4}"#).await.0, 200);
     }
 
     #[tokio::test]
