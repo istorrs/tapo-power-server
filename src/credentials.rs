@@ -66,19 +66,28 @@ impl Credentials {
     /// Load `TAPO_EMAIL=` / `TAPO_PASSWORD=` lines from a file. On Unix the
     /// file must not be readable by group or others.
     pub fn from_file(path: &Path) -> Result<Self, CredentialsError> {
+        use std::io::Read;
+        // Open once and check the permissions of the file actually opened, then
+        // read through the same handle: checking the path and then reading it
+        // separately would let a replacement slip in between.
+        let mut file =
+            std::fs::File::open(path).map_err(|e| CredentialsError::Read(e.kind().to_string()))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| CredentialsError::Read(e.kind().to_string()))?;
+        if !meta.is_file() {
+            return Err(CredentialsError::Read("not a regular file".into()));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let meta = std::fs::metadata(path)
-                .map_err(|e| CredentialsError::Read(e.kind().to_string()))?;
             if meta.permissions().mode() & 0o077 != 0 {
                 return Err(CredentialsError::Permissions(path.display().to_string()));
             }
         }
-        let text = Zeroizing::new(
-            std::fs::read_to_string(path)
-                .map_err(|e| CredentialsError::Read(e.kind().to_string()))?,
-        );
+        let mut text = Zeroizing::new(String::new());
+        file.read_to_string(&mut text)
+            .map_err(|e| CredentialsError::Read(e.kind().to_string()))?;
         Self::parse(&text)
     }
 
@@ -187,6 +196,14 @@ mod tests {
         let c = Credentials::new("a@b.c".into(), "hunter2".into()).unwrap();
         let s = format!("{c:?}");
         assert!(!s.contains("hunter2") && !s.contains("a@b.c"));
+    }
+
+    #[test]
+    fn a_directory_is_not_a_credentials_file() {
+        assert!(matches!(
+            Credentials::from_file(&std::env::temp_dir()),
+            Err(CredentialsError::Read(_))
+        ));
     }
 
     #[cfg(unix)]

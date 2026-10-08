@@ -25,6 +25,10 @@ use crate::{
 
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(45);
 const MAX_PBKDF2_ITERATIONS: u32 = 5_000_000;
+/// Upper bound on any device response body. Real replies are a few KiB; the
+/// transport is plain HTTP, so an on-path peer could otherwise stream an
+/// unbounded body into memory before it is ever authenticated.
+const MAX_RESPONSE_BYTES: usize = 1 << 20;
 /// Login attempts that may end with an unknown outcome before login is disabled.
 const MAX_UNRESOLVED_PROOFS: u8 = 3;
 
@@ -164,6 +168,44 @@ pub(crate) fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Read a response body, failing as soon as it exceeds [`MAX_RESPONSE_BYTES`]
+/// (checked while streaming, so chunked bodies without a length are covered).
+async fn read_limited(mut resp: reqwest::Response) -> Result<Vec<u8>, TapoError> {
+    let too_large = || {
+        TapoError::Protocol(format!(
+            "response is too large (limit {MAX_RESPONSE_BYTES} bytes)"
+        ))
+    };
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| TapoError::Transport(describe(&e)))?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// `http://host:port`, bracketing a bare IPv6 literal (`::1` -> `[::1]`) and
+/// leaving IPv4 addresses, hostnames and already-bracketed hosts untouched.
+fn base_url(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
 }
 
 fn field_str<'a>(v: &'a Value, key: &str) -> Result<&'a str, TapoError> {
@@ -367,11 +409,8 @@ impl TpapClient {
                 resp.status().as_u16()
             )));
         }
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| TapoError::Transport(describe(&e)))?;
-        let envelope: Value = serde_json::from_str(&text)
+        let text = read_limited(resp).await?;
+        let envelope: Value = serde_json::from_slice(&text)
             .map_err(|_| TapoError::Protocol(format!("{step}: response is not JSON")))?;
         check_error_code(&envelope, step)?;
         envelope
@@ -381,7 +420,7 @@ impl TpapClient {
     }
 
     async fn discover(&self) -> Result<Discovery, TapoError> {
-        let first = format!("http://{}:{}", self.config.host, self.config.port);
+        let first = base_url(&self.config.host, self.config.port);
         let result = self
             .post_login(&first, "discover", json!({ "sub_method": "discover" }))
             .await?;
@@ -400,7 +439,7 @@ impl TpapClient {
             .and_then(|p| u16::try_from(p).ok())
             .unwrap_or(80);
         Ok(Discovery {
-            base_url: format!("http://{}:{}", self.config.host, port),
+            base_url: base_url(&self.config.host, port),
             mac_no_sep: result
                 .get("mac")
                 .and_then(Value::as_str)
@@ -572,10 +611,7 @@ impl TpapClient {
             401 => return Err(TapoError::Device { code: -40401 }),
             n => return Err(TapoError::Protocol(format!("request: HTTP {n}"))),
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| TapoError::Transport(describe(&e)))?;
+        let bytes = read_limited(resp).await?;
         let (json_bytes, authenticated) = match live.session.decrypt_response(&bytes, seq)? {
             Reply::Plain(b) => (b, false),
             Reply::Decrypted(b) => (b, true),
@@ -1086,5 +1122,72 @@ mod tests {
             second.is_err(),
             "the redirect target must not receive a connection"
         );
+    }
+
+    #[test]
+    fn base_url_brackets_only_bare_ipv6() {
+        assert_eq!(base_url("192.168.1.213", 80), "http://192.168.1.213:80");
+        assert_eq!(base_url("tapo.lan", 8080), "http://tapo.lan:8080");
+        assert_eq!(base_url("::1", 80), "http://[::1]:80");
+        assert_eq!(base_url("fe80::1234", 80), "http://[fe80::1234]:80");
+        assert_eq!(base_url("[::1]", 80), "http://[::1]:80");
+        // The result must be a valid URL for the HTTP client.
+        for h in ["::1", "10.0.0.5", "tapo.lan", "[::1]"] {
+            assert!(reqwest::Url::parse(&base_url(h, 80)).is_ok(), "{h}");
+        }
+    }
+
+    /// A raw server that answers every request with a huge body, sending
+    /// either a huge `Content-Length` or an endless chunked stream.
+    async fn oversized_server(chunked: bool) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let head = if chunked {
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 104857600\r\n\r\n"
+            };
+            let _ = sock.write_all(head.as_bytes()).await;
+            let block = vec![b'a'; 4096];
+            // Stop at 8 MiB (or when the client hangs up): never an endless loop.
+            for _ in 0..2048 {
+                let frame: Vec<u8> = if chunked {
+                    let mut f = b"1000\r\n".to_vec();
+                    f.extend_from_slice(&block);
+                    f.extend_from_slice(b"\r\n");
+                    f
+                } else {
+                    block.clone()
+                };
+                if sock.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn oversized_responses_are_rejected_while_streaming() {
+        for chunked in [false, true] {
+            let port = oversized_server(chunked).await;
+            let mut config = ClientConfig::new("127.0.0.1");
+            config.port = port;
+            let client = TpapClient::new(
+                config,
+                Credentials::new("a@b.c".into(), "pw".into()).unwrap(),
+            )
+            .unwrap();
+            let err = client.connect().await.unwrap_err();
+            assert!(
+                matches!(err, TapoError::Protocol(_)) && err.to_string().contains("too large"),
+                "chunked={chunked}: {err}"
+            );
+        }
     }
 }
